@@ -1,94 +1,302 @@
+// components/Sidebar.tsx - Complete with proper types
+import React, { ChangeEvent } from 'react';
+import { AssistantConfig, AnalysisMode } from '../types';
 
-import React from 'react';
-import { AnalysisMode, AssistantConfig } from '../types';
+// Define interfaces
+interface ProcessingJob {
+  id: string;
+  filename: string;
+  status: 'queued' | 'processing' | 'completed' | 'error';
+  progress: number;
+  message?: string;
+  chunks_processed?: number;
+  document_id?: string;
+}
+
+interface Document {
+  id: string;
+  filename: string;
+  title: string;
+  author: string;
+  year: string;
+  chunk_count: number;
+  upload_time: number;
+  status: string;
+}
 
 interface SidebarProps {
   config: AssistantConfig;
   setConfig: (config: AssistantConfig) => void;
-  onFileUpload: (e: React.ChangeEvent<HTMLInputElement>) => void;
-  documentCount: number;
+  onFileUpload: (e: ChangeEvent<HTMLInputElement>) => void;
+  documents: Document[];
+  processingJobs: ProcessingJob[];
+  backendStatus: 'online' | 'offline' | 'checking';
+  onDeleteDocument: (docId: string) => void;
+  onRefreshDocuments: () => void;
 }
 
-export const Sidebar: React.FC<SidebarProps> = ({ config, setConfig, onFileUpload, documentCount }) => {
+export const Sidebar: React.FC<SidebarProps> = ({
+  config,
+  setConfig,
+  onFileUpload,
+  documents,
+  processingJobs,
+  backendStatus,
+  onDeleteDocument,
+  onRefreshDocuments
+}) => {
+  const activeJobs = processingJobs.filter(j => j.status === 'processing');
+  const completedJobs = processingJobs.filter(j => j.status === 'completed');
+
   return (
-    <div className="w-80 h-full border-r border-slate-200 bg-white p-6 flex flex-col gap-8 overflow-y-auto custom-scrollbar">
-      <div>
-        <h1 className="text-xl font-bold text-indigo-600 mb-1">NexusAI</h1>
-        <p className="text-xs text-slate-500 font-medium uppercase tracking-wider">Custom Knowledge Interface</p>
+    <aside className="w-80 bg-white border-r border-gray-200 flex flex-col h-full">
+      {/* Header */}
+      <div className="p-4 border-b">
+        <h1 className="text-lg font-bold text-gray-800">NexusAI</h1>
+        <p className="text-sm text-gray-500">Multi-Document RAG</p>
+        <div className="mt-2 flex items-center gap-2">
+          <span className={`inline-flex items-center px-2 py-1 rounded text-xs ${
+            backendStatus === 'online' ? 'bg-green-100 text-green-700' : 
+            backendStatus === 'offline' ? 'bg-red-100 text-red-700' : 
+            'bg-yellow-100 text-yellow-700'
+          }`}>
+            <span className={`w-1.5 h-1.5 rounded-full mr-1 ${
+              backendStatus === 'online' ? 'bg-green-500' : 
+              backendStatus === 'offline' ? 'bg-red-500' : 
+              'bg-yellow-500'
+            }`}></span>
+            {backendStatus === 'online' ? 'Online' : 
+             backendStatus === 'offline' ? 'Offline' : 'Checking...'}
+          </span>
+          <span className="text-xs text-gray-500">
+            {documents.length} docs • {processingJobs.length} jobs
+          </span>
+        </div>
       </div>
 
-      <section>
-        <h3 className="text-sm font-semibold text-slate-700 mb-4 flex items-center gap-2">
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
-          Knowledge Base
-        </h3>
-        <label className="block w-full cursor-pointer group">
-          <div className="border-2 border-dashed border-slate-200 group-hover:border-indigo-400 rounded-xl p-6 transition-all bg-slate-50 text-center">
-            <svg className="w-8 h-8 text-slate-400 group-hover:text-indigo-500 mx-auto mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
-            <span className="text-xs font-medium text-slate-600 block">Upload PDFs/Texts</span>
-            <input type="file" className="hidden" multiple onChange={onFileUpload} accept=".pdf,.txt,.docx" />
-          </div>
+      {/* Upload Section */}
+      <div className="p-4 border-b">
+        <label className="block text-sm font-medium text-gray-700 mb-2">
+          📄 Upload PDFs
         </label>
-        <p className="mt-3 text-xs text-slate-500 italic">
-          {documentCount} chunks indexed in vector store.
-        </p>
-      </section>
-
-      <section className="space-y-6">
-        <h3 className="text-sm font-semibold text-slate-700 flex items-center gap-2">
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"></path></svg>
-          Model Parameters
-        </h3>
-
-        <div className="space-y-2">
-          <div className="flex justify-between items-center">
-            <label className="text-xs font-medium text-slate-600 uppercase">Temperature</label>
-            <span className="text-xs font-bold text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded">{config.temperature}</span>
-          </div>
-          <input 
-            type="range" 
-            min="0" max="1" step="0.1" 
-            value={config.temperature} 
-            onChange={(e) => setConfig({ ...config, temperature: parseFloat(e.target.value) })}
-            className="w-full h-1.5 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+        <div className="relative">
+          <input
+            type="file"
+            accept=".pdf"
+            multiple
+            onChange={onFileUpload}
+            className="hidden"
+            id="file-upload"
+            disabled={backendStatus !== 'online'}
           />
-        </div>
-
-        <div className="space-y-3">
-          <label className="text-xs font-medium text-slate-600 uppercase">Response Mode</label>
-          <div className="grid grid-cols-2 gap-2">
-            <button 
-              onClick={() => setConfig({ ...config, mode: AnalysisMode.SUMMARIZE })}
-              className={`px-3 py-2 text-xs font-semibold rounded-lg border transition-all ${config.mode === AnalysisMode.SUMMARIZE ? 'bg-indigo-600 text-white border-indigo-600 shadow-md' : 'bg-white text-slate-600 border-slate-200 hover:border-indigo-300'}`}
-            >
-              Summarize
-            </button>
-            <button 
-              onClick={() => setConfig({ ...config, mode: AnalysisMode.ANALYZE })}
-              className={`px-3 py-2 text-xs font-semibold rounded-lg border transition-all ${config.mode === AnalysisMode.ANALYZE ? 'bg-indigo-600 text-white border-indigo-600 shadow-md' : 'bg-white text-slate-600 border-slate-200 hover:border-indigo-300'}`}
-            >
-              Analyze
-            </button>
-          </div>
-        </div>
-
-        <div className="flex items-center justify-between py-2">
-          <label className="text-xs font-medium text-slate-600 uppercase">Cite Sources</label>
-          <button 
-            onClick={() => setConfig({ ...config, citeSources: !config.citeSources })}
-            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus:outline-none ${config.citeSources ? 'bg-indigo-600' : 'bg-slate-300'}`}
+          <label
+            htmlFor="file-upload"
+            className={`block w-full text-center py-2 px-3 rounded border cursor-pointer text-sm font-medium transition-colors ${
+              backendStatus === 'online'
+                ? 'bg-blue-50 hover:bg-blue-100 text-blue-700 border-blue-200'
+                : 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed'
+            }`}
           >
-            <span className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${config.citeSources ? 'translate-x-5' : 'translate-x-1'}`} />
-          </button>
-        </div>
-      </section>
-
-      <div className="mt-auto">
-        <div className="p-4 rounded-xl bg-slate-900 text-white text-[10px] leading-relaxed opacity-80">
-          <p className="font-bold mb-1 text-indigo-400">RAG ARCHITECTURE ACTIVE</p>
-          Using Gemini-3-Pro for generation and multi-part context window for domain alignment.
+            Select PDF Files
+          </label>
+          <p className="text-xs text-gray-500 mt-2">
+            Supports multiple large PDFs simultaneously
+          </p>
         </div>
       </div>
-    </div>
+
+      {/* Processing Jobs */}
+      {processingJobs.length > 0 && (
+        <div className="p-4 border-b">
+          <div className="flex justify-between items-center mb-2">
+            <h3 className="text-sm font-medium text-gray-700">🔄 Processing Jobs</h3>
+            <span className="text-xs bg-blue-100 text-blue-700 px-2 py-1 rounded-full">
+              {processingJobs.length}
+            </span>
+          </div>
+          <div className="space-y-2 max-h-40 overflow-y-auto">
+            {processingJobs.slice(0, 5).map(job => (
+              <div key={job.id} className="bg-gray-50 p-3 rounded border border-gray-200">
+                <div className="text-xs font-medium truncate mb-1">{job.filename}</div>
+                <div className="flex items-center justify-between mb-1">
+                  <span className={`text-xs font-medium ${
+                    job.status === 'processing' ? 'text-blue-600' :
+                    job.status === 'completed' ? 'text-green-600' : 
+                    'text-red-600'
+                  }`}>
+                    {job.status.charAt(0).toUpperCase() + job.status.slice(1)}
+                  </span>
+                  <span className="text-xs font-bold">{job.progress}%</span>
+                </div>
+                <div className="w-full bg-gray-200 rounded-full h-1.5">
+                  <div 
+                    className={`h-1.5 rounded-full ${
+                      job.status === 'processing' ? 'bg-blue-500' :
+                      job.status === 'completed' ? 'bg-green-500' : 
+                      'bg-red-500'
+                    }`}
+                    style={{ width: `${job.progress}%` }}
+                  ></div>
+                </div>
+                {job.message && (
+                  <div className="text-xs text-gray-500 mt-1 truncate">{job.message}</div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Documents List */}
+      <div className="p-4 border-b flex-1 overflow-y-auto">
+        <div className="flex justify-between items-center mb-3">
+          <h3 className="text-sm font-medium text-gray-700">📚 Documents</h3>
+          <div className="flex gap-2">
+            <button
+              onClick={onRefreshDocuments}
+              className="text-xs text-blue-600 hover:text-blue-800"
+              title="Refresh documents"
+            >
+              ↻
+            </button>
+            <span className="text-xs text-gray-500">
+              {documents.length} loaded
+            </span>
+          </div>
+        </div>
+        <div className="space-y-3">
+          {documents.map(doc => (
+            <div key={doc.id} className="bg-gray-50 p-3 rounded border border-gray-200 hover:bg-gray-100 transition-colors">
+              <div className="flex justify-between items-start">
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm font-medium text-gray-800 truncate">
+                    {doc.title || doc.filename}
+                  </div>
+                  <div className="text-xs text-gray-500 mt-1">
+                    {doc.author && <span>{doc.author} • </span>}
+                    {doc.chunk_count} chunks
+                  </div>
+                  {doc.year && (
+                    <div className="text-xs text-gray-400 mt-1">{doc.year}</div>
+                  )}
+                </div>
+                <button
+                  onClick={() => onDeleteDocument(doc.id)}
+                  className="text-xs text-red-500 hover:text-red-700 ml-2 p-1"
+                  title="Delete document"
+                >
+                  ×
+                </button>
+              </div>
+              <div className="flex items-center justify-between mt-2">
+                <span className={`text-xs px-2 py-0.5 rounded ${
+                  doc.status === 'loaded' ? 'bg-green-100 text-green-700' :
+                  doc.status === 'processing' ? 'bg-blue-100 text-blue-700' :
+                  'bg-gray-100 text-gray-700'
+                }`}>
+                  {doc.status}
+                </span>
+                <span className="text-xs text-gray-500">
+                  {new Date(doc.upload_time * 1000).toLocaleDateString()}
+                </span>
+              </div>
+            </div>
+          ))}
+          {documents.length === 0 && (
+            <div className="text-center py-8 text-gray-400">
+              <div className="text-3xl mb-2">📄</div>
+              <p className="text-sm">No documents uploaded yet</p>
+              <p className="text-xs mt-1">Upload PDFs to get started</p>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Configuration */}
+      <div className="p-4 border-t">
+        <h3 className="text-sm font-medium text-gray-700 mb-3">⚙️ Configuration</h3>
+        
+        <div className="space-y-4">
+          {/* Citations Toggle */}
+          <div className="flex items-center justify-between">
+            <div>
+              <span className="text-sm text-gray-600">Citations</span>
+              <p className="text-xs text-gray-500">Show page references</p>
+            </div>
+            <button
+              onClick={() => setConfig({ ...config, citeSources: !config.citeSources })}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                config.citeSources ? 'bg-blue-500' : 'bg-gray-300'
+              }`}
+            >
+              <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                config.citeSources ? 'translate-x-6' : 'translate-x-1'
+              }`} />
+            </button>
+          </div>
+
+          {/* Analysis Mode */}
+          <div>
+            <label className="block text-sm text-gray-600 mb-2">
+              Analysis Mode
+            </label>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setConfig({ ...config, mode: AnalysisMode.SUMMARIZE })}
+                className={`flex-1 text-xs py-2 rounded border ${
+                  config.mode === AnalysisMode.SUMMARIZE
+                    ? 'bg-blue-50 border-blue-300 text-blue-700 font-medium'
+                    : 'bg-gray-50 border-gray-200 text-gray-600'
+                }`}
+              >
+                Summarize
+              </button>
+              <button
+                onClick={() => setConfig({ ...config, mode: AnalysisMode.ANALYZE })}
+                className={`flex-1 text-xs py-2 rounded border ${
+                  config.mode === AnalysisMode.ANALYZE
+                    ? 'bg-blue-50 border-blue-300 text-blue-700 font-medium'
+                    : 'bg-gray-50 border-gray-200 text-gray-600'
+                }`}
+              >
+                Analyze
+              </button>
+            </div>
+          </div>
+
+          {/* Temperature */}
+          <div>
+            <div className="flex justify-between mb-1">
+              <span className="text-sm text-gray-600">Temperature</span>
+              <span className="text-xs text-gray-500">{config.temperature.toFixed(1)}</span>
+            </div>
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.1"
+              value={config.temperature}
+              onChange={(e) => setConfig({ ...config, temperature: parseFloat(e.target.value) })}
+              className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+            />
+            <div className="flex justify-between text-xs text-gray-500 mt-1">
+              <span>Precise</span>
+              <span>Creative</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div className="mt-6 pt-4 border-t border-gray-200">
+          <div className="text-xs text-gray-500">
+            <div className="font-medium">NexusAI v5.0</div>
+            <div>Multi-Document RAG System</div>
+            <div className="mt-2">
+              Total chunks: {documents.reduce((sum, doc) => sum + doc.chunk_count, 0)}
+            </div>
+          </div>
+        </div>
+      </div>
+    </aside>
   );
 };

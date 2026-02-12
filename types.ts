@@ -1,4 +1,4 @@
-
+// types.ts - UPDATED
 export interface DocumentChunk {
   id: string;
   fileName: string;
@@ -6,14 +6,14 @@ export interface DocumentChunk {
   pageNumber: number;
   author?: string;
   year?: string;
-  embedding?: number[];
+  embeddingDimension?: number;  // ADD THIS LINE
 }
 
 export interface Message {
   id: string;
   role: 'user' | 'assistant';
   content: string;
-  sources?: string[];
+  sources?: string[];  // ADD THIS LINE
   timestamp: number;
 }
 

@@ -1,74 +1,187 @@
-
-import React, { useState, useCallback } from 'react';
+// App.tsx - COMPLETE FIXED VERSION
+import React, { useState, useEffect, ChangeEvent } from 'react';
 import { Sidebar } from './components/Sidebar';
 import { ChatWindow } from './components/ChatWindow';
-import { GeminiService } from './services/geminiService';
-import { DocumentChunk, Message, AssistantConfig, AnalysisMode } from './types';
+import { Message, AssistantConfig, AnalysisMode } from './types';
+
+const BACKEND_URL = "http://127.0.0.1:8000";
+
+interface ProcessingJob {
+  id: string;
+  filename: string;
+  status: 'queued' | 'processing' | 'completed' | 'error';
+  progress: number;
+  message?: string;
+  chunks_processed?: number;
+  document_id?: string;
+}
+
+interface Document {
+  id: string;
+  filename: string;
+  title: string;
+  author: string;
+  year: string;
+  chunk_count: number;
+  upload_time: number;
+  status: string;
+}
 
 const App: React.FC = () => {
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<Message[]>([
+    {
+      id: '1',
+      role: 'assistant',
+      content: '🚀 **NexusAI Multi-Document RAG Ready**\n\n• Upload multiple PDFs\n• Document-level tracking\n• Cross-document search\n• Smart citations',
+      timestamp: Date.now()
+    }
+  ]);
+  
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [corpus, setCorpus] = useState<DocumentChunk[]>([]);
+  const [documents, setDocuments] = useState<Document[]>([]);
+  const [processingJobs, setProcessingJobs] = useState<ProcessingJob[]>([]);
+  const [backendStatus, setBackendStatus] = useState<'online' | 'offline' | 'checking'>('checking');
   const [config, setConfig] = useState<AssistantConfig>({
     temperature: 0.7,
     citeSources: true,
     mode: AnalysisMode.ANALYZE,
-    systemPrompt: "You are an expert theoretical analyst. Your role is to examine input texts through the lens of the provided domain knowledge base. Maintain academic rigor, objective distance, and consistent professional tone. Always prioritize APA citations."
+    systemPrompt: "You are an expert analyst examining multiple documents."
   });
 
-  const [gemini] = useState(() => new GeminiService());
+  // Check system status
+  useEffect(() => {
+    checkBackendStatus();
+    fetchDocuments();
+    const interval = setInterval(() => {
+      checkBackendStatus();
+      fetchDocuments();
+    }, 10000);
+    return () => clearInterval(interval);
+  }, []);
 
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const checkBackendStatus = async (): Promise<void> => {
+    try {
+      const response = await fetch(`${BACKEND_URL}/system`);
+      setBackendStatus(response.ok ? 'online' : 'offline');
+    } catch {
+      setBackendStatus('offline');
+    }
+  };
+
+  const fetchDocuments = async (): Promise<void> => {
+    try {
+      const response = await fetch(`${BACKEND_URL}/documents`);
+      if (response.ok) {
+        const data = await response.json();
+        setDocuments(data.documents || []);
+      }
+    } catch (error) {
+      console.error('Error fetching documents:', error);
+    }
+  };
+
+  const handleFileUpload = async (e: ChangeEvent<HTMLInputElement>): Promise<void> => {
     const files = e.target.files;
     if (!files) return;
 
     setIsLoading(true);
-    const newChunks: DocumentChunk[] = [];
-    const currentYear = new Date().getFullYear().toString();
+    
+    // Convert FileList to Array with proper typing
+    const fileArray: File[] = Array.from(files);
+    
+    for (const file of fileArray) {
+      if (!file.name.toLowerCase().endsWith('.pdf')) {
+        setMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: `⚠️ Skipping non-PDF: ${file.name}`,
+          timestamp: Date.now()
+        }]);
+        continue;
+      }
 
-    for (const file of Array.from(files) as File[]) {
-      // Simulate multiple pages per file
-      const pages = Math.floor(Math.random() * 20) + 5;
-      for(let p = 1; p <= pages; p++) {
-        const text = `Simulated content from ${file.name}, page ${p}. Discussing core theoretical framework components and evidence supporting the central hypothesis. This section emphasizes the importance of consistent methodology and domain-aligned analysis.`;
-        
-        newChunks.push({
-          id: Math.random().toString(36).substr(2, 9),
-          fileName: file.name,
-          text: text,
-          pageNumber: p,
-          author: "Researcher, A.", // Simulated author
-          year: currentYear
+      const formData = new FormData();
+      formData.append('file', file); // File is a Blob type
+
+      try {
+        const response = await fetch(`${BACKEND_URL}/upload`, {
+          method: 'POST',
+          body: formData,
         });
+
+        if (!response.ok) {
+          throw new Error(`Upload failed: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        
+        if (data.job_id) {
+          const newJob: ProcessingJob = {
+            id: data.job_id,
+            filename: data.filename,
+            status: 'queued',
+            progress: 0,
+            message: data.message
+          };
+          
+          setProcessingJobs(prev => [...prev, newJob]);
+          pollJobStatus(data.job_id, data.filename);
+          
+          setMessages(prev => [...prev, {
+            id: Date.now().toString(),
+            role: 'assistant',
+            content: `📤 **Document queued**: ${data.filename}`,
+            timestamp: Date.now()
+          }]);
+        }
+      } catch (error) {
+        console.error('Upload error:', error);
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        setMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: `❌ **Upload failed for ${file.name}**: ${errorMessage}`,
+          timestamp: Date.now()
+        }]);
       }
     }
-
-    setCorpus(prev => [...prev, ...newChunks]);
-    
-    setMessages(prev => [...prev, {
-      id: Date.now().toString(),
-      role: 'assistant',
-      content: `Successfully ingested and indexed ${files.length} documents (${newChunks.length} pages total). I have extracted author and page metadata to support APA-compliant citations.`,
-      timestamp: Date.now()
-    }]);
     
     setIsLoading(false);
   };
 
-  const handleEditMessage = (id: string) => {
-    const messageToEdit = messages.find(m => m.id === id);
-    if (!messageToEdit || messageToEdit.role !== 'user') return;
-
-    // Put text back in input
-    setInput(messageToEdit.content);
-    
-    // Remove this message and all subsequent ones (creating a new branch)
-    const index = messages.findIndex(m => m.id === id);
-    setMessages(messages.slice(0, index));
+  const pollJobStatus = async (jobId: string, filename: string): Promise<void> => {
+    const interval = setInterval(async () => {
+      try {
+        const response = await fetch(`${BACKEND_URL}/jobs/${jobId}`);
+        const data = await response.json();
+        
+        setProcessingJobs(prev => 
+          prev.map(job => 
+            job.id === jobId ? { ...job, ...data, filename } : job
+          )
+        );
+        
+        if (data.status === 'completed' || data.status === 'error') {
+          clearInterval(interval);
+          fetchDocuments();
+          
+          setMessages(prev => [...prev, {
+            id: Date.now().toString(),
+            role: 'assistant',
+            content: data.status === 'completed' 
+              ? `✅ **Document loaded**: ${filename} (${data.chunks_processed || 0} chunks)`
+              : `❌ **Failed**: ${filename} - ${data.message || 'Unknown error'}`,
+            timestamp: Date.now()
+          }]);
+        }
+      } catch (error) {
+        console.error('Polling error:', error);
+      }
+    }, 2000);
   };
 
-  const handleSend = async () => {
+  const handleSend = async (): Promise<void> => {
     if (!input.trim() || isLoading) return;
 
     const userMsg: Message = {
@@ -83,33 +196,39 @@ const App: React.FC = () => {
     setIsLoading(true);
 
     try {
-      // Improved retrieval simulation: pick chunks that might be relevant
-      const relevantContext = corpus.length > 0 
-        ? corpus.sort(() => 0.5 - Math.random()).slice(0, 3) 
-        : [];
+      const response = await fetch(`${BACKEND_URL}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+          message: input,
+          include_citations: config.citeSources,
+          detailed: config.mode === AnalysisMode.ANALYZE
+        })
+      });
 
-      const response = await gemini.generateResponse(
-        input,
-        messages.map(m => ({ role: m.role, content: m.content })),
-        relevantContext,
-        config
-      );
+      if (!response.ok) {
+        throw new Error(`Backend error: ${response.statusText}`);
+      }
+
+      const data = await response.json();
 
       const assistantMsg: Message = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
-        content: response.text || "I encountered an error generating the APA analysis.",
-        sources: config.citeSources ? Array.from(new Set(relevantContext.map(c => c.fileName))) : [],
+        content: data.answer || "No response received",
+        sources: data.sources || [],
         timestamp: Date.now()
       };
 
       setMessages(prev => [...prev, assistantMsg]);
+
     } catch (error) {
-      console.error("Gemini Error:", error);
+      console.error("API Error:", error);
+      const errorMessage = error instanceof Error ? error.message : 'Connection failed';
       setMessages(prev => [...prev, {
         id: Date.now().toString(),
         role: 'assistant',
-        content: "Error: Analysis failed. Please verify your connection to the intelligence bridge.",
+        content: `❌ Error: ${errorMessage}`,
         timestamp: Date.now()
       }]);
     } finally {
@@ -117,14 +236,50 @@ const App: React.FC = () => {
     }
   };
 
+  const deleteDocument = async (docId: string): Promise<void> => {
+    if (!window.confirm('Delete this document?')) return;
+    
+    try {
+      const response = await fetch(`${BACKEND_URL}/documents/${docId}`, {
+        method: 'DELETE'
+      });
+      
+      if (response.ok) {
+        fetchDocuments();
+        setMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: '🗑️ Document deleted',
+          timestamp: Date.now()
+        }]);
+      }
+    } catch (error) {
+      console.error('Delete error:', error);
+    }
+  };
+
+  const handleEditMessage = (id: string): void => {
+    const messageToEdit = messages.find(m => m.id === id);
+    if (!messageToEdit || messageToEdit.role !== 'user') return;
+
+    setInput(messageToEdit.content);
+    const index = messages.findIndex(m => m.id === id);
+    setMessages(messages.slice(0, index));
+  };
+
   return (
-    <div className="flex h-screen w-full bg-[#f8fafc]">
+    <div className="flex h-screen w-full bg-gray-50">
       <Sidebar 
-        config={config} 
-        setConfig={setConfig} 
-        onFileUpload={handleFileUpload} 
-        documentCount={corpus.length}
+        config={config}
+        setConfig={setConfig}
+        onFileUpload={handleFileUpload}
+        documents={documents}
+        processingJobs={processingJobs}
+        backendStatus={backendStatus}
+        onDeleteDocument={deleteDocument}
+        onRefreshDocuments={fetchDocuments}
       />
+      
       <main className="flex-1 overflow-hidden relative">
         <ChatWindow 
           messages={messages}
@@ -135,9 +290,14 @@ const App: React.FC = () => {
           isLoading={isLoading}
         />
         
-        <div className="absolute top-4 right-4 flex items-center gap-2 bg-white/50 backdrop-blur px-3 py-1.5 rounded-full border border-slate-200 text-[10px] font-bold text-slate-500 uppercase">
-          <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></div>
-          APA Intelligence active
+        <div className={`absolute top-4 right-4 flex items-center gap-2 px-3 py-1.5 rounded-full border text-xs font-bold
+          ${backendStatus === 'online' 
+            ? 'bg-green-100 border-green-300 text-green-700' 
+            : 'bg-red-100 border-red-300 text-red-700'}`}>
+          <div className={`w-2 h-2 rounded-full ${backendStatus === 'online' ? 'bg-green-500' : 'bg-red-500'}`}></div>
+          {backendStatus === 'online' 
+            ? `Online (${documents.length} docs)` 
+            : 'Offline'}
         </div>
       </main>
     </div>

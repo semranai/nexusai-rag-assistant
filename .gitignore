@@ -22,3 +22,20 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+env/
+venv/
+
+# Env
+.env
+
+# Local data
+data/
+uploaded_pdfs/
+
+# OS
+.DS_Store
