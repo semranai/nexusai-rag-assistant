@@ -51,6 +51,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+def root():
+    return {
+        "service": "NexusAI RAG Assistant",
+        "status": "ok",
+        "docs_url": "/docs",
+        "system_url": "/system"
+    }
+
 _last_ingest_error: Optional[str] = None
 
 
@@ -224,14 +233,6 @@ def _vector_search_compare(question: str, doc_ids: List[str], top_k_per_doc: int
         )
     return out
 
-@app.get("/")
-def root():
-    return {
-        "service": "NexusAI RAG Assistant",
-        "status": "ok",
-        "docs_url": "/docs",
-        "system_url": "/system"
-    }
 
 
 
