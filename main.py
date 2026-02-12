@@ -13,6 +13,9 @@ from embeddings import embedder
 from vector_store import StoredChunk, StoredDocument, vector_store
 from answer_generator import generate_answer, generate_comparison_answer, INSUFFICIENT_MSG
 
+ENABLE_OCR = os.getenv("ENABLE_OCR", "false").strip().lower() == "true"
+
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", os.path.join(BASE_DIR, "uploaded_pdfs"))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
