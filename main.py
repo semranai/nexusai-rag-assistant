@@ -224,6 +224,16 @@ def _vector_search_compare(question: str, doc_ids: List[str], top_k_per_doc: int
         )
     return out
 
+@app.get("/")
+def root():
+    return {
+        "service": "NexusAI RAG Assistant",
+        "status": "ok",
+        "docs_url": "/docs",
+        "system_url": "/system"
+    }
+
+
 
 @app.get("/system")
 def system_status() -> Dict[str, Any]:
