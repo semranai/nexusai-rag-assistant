@@ -3,9 +3,9 @@ import os
 import re
 import uuid
 from typing import Any, Dict, List, Optional
-
 import fitz  # PyMuPDF
 
+ENABLE_OCR = os.getenv("ENABLE_OCR", "false").strip().lower() == "true"
 
 def _env_true(name: str, default: str = "0") -> bool:
     v = os.getenv(name, default)
@@ -92,11 +92,14 @@ def read_pdf_chunks(
         text = (page.get_text("text") or "").strip()
 
         # If OCR enabled AND page has too little text, attempt OCR (best-effort)
+        text = (text or "").strip()
+
         if ENABLE_OCR and len(text) < min_text_chars_per_page:
             pix = page.get_pixmap(dpi=200)
             ocr_text = _try_ocr_page(pix)
             if ocr_text:
                 text = ocr_text
+
 
         if not text:
             # skip empty pages
