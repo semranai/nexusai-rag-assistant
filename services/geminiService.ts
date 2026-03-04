@@ -7,16 +7,21 @@ export class GeminiService {
     context: any[],
     config: AssistantConfig
   ): Promise<any> {
+    // Backend base URL:
+    // - Local dev: set in .env (VITE_API_BASE_URL=http://127.0.0.1:8000)
+    // - Production: set in your hosting dashboard env vars (VITE_API_BASE_URL=https://...)
+    const API_BASE_URL =
+      import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
 
-    const response = await fetch("http://localhost:8000/query", {
+    const response = await fetch(`${API_BASE_URL}/query`, {
       method: "POST",
       headers: {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
       },
       body: JSON.stringify({
         question: query,
-        top_k: 5
-      })
+        top_k: 5,
+      }),
     });
 
     if (!response.ok) {
@@ -28,7 +33,7 @@ export class GeminiService {
     return {
       text: data.answer,
       citations: data.citations,
-      evidence: data.evidence
+      evidence: data.evidence,
     };
   }
 }
