@@ -3,18 +3,81 @@ import os
 import re
 import uuid
 from typing import Any, Dict, List, Optional
+
 import fitz  # PyMuPDF
 
-ENABLE_OCR = os.getenv("ENABLE_OCR", "false").strip().lower() == "true"
 
 def _env_true(name: str, default: str = "0") -> bool:
     v = os.getenv(name, default)
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-# OCR is OFF by default on servers like Render (no tesseract binary).
+# OCR flags
 DISABLE_OCR = _env_true("DISABLE_OCR", "1")  # default: disabled
 ENABLE_OCR = _env_true("ENABLE_OCR", "0") and (not DISABLE_OCR)
+
+# Optional: Windows path to tesseract.exe
+TESSERACT_CMD = (os.getenv("TESSERACT_CMD") or "").strip()
+
+
+def _looks_like_low_signal_text(text: str) -> bool:
+    """
+    Detect pages where extracted text exists but is basically useless
+    (headers/course codes/page numbers) while main content is likely an image.
+
+    Heuristics:
+    - very low alphanumeric content
+    - mostly short tokens / numbers
+    - looks like slide footer/header only
+    """
+    if not text:
+        return True
+
+    t = re.sub(r"\s+", " ", text).strip()
+    if len(t) < 40:
+        return True
+
+    # Ratio of alphanumeric chars
+    alnum = sum(ch.isalnum() for ch in t)
+    ratio = alnum / max(1, len(t))
+
+    # If mostly non-alphanumeric (bullets, symbols, lines) -> low signal
+    if ratio < 0.35:
+        return True
+
+    # If it looks like just course/page markers (common in slide decks)
+    footer_signals = ["420-", "page", "chapter", "presented by"]
+    footer_hits = sum(1 for s in footer_signals if s in t.lower())
+
+    # If short and dominated by footer signals -> low signal
+    if len(t) < 120 and footer_hits >= 1:
+        return True
+
+    return False
+
+
+def _try_ocr_page(page: "fitz.Page", dpi: int = 250) -> str:
+    """
+    Best-effort OCR. If tesseract isn't installed or misconfigured, return "".
+    """
+    try:
+        import pytesseract
+        from PIL import Image
+
+        # Apply explicit tesseract path (important on Windows)
+        if TESSERACT_CMD:
+            pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+
+        pix = page.get_pixmap(dpi=dpi)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+        # You can tweak config; this is a decent default
+        config = "--oem 3 --psm 6"
+        text = pytesseract.image_to_string(img, config=config)
+
+        return (text or "").strip()
+    except Exception:
+        return ""
 
 
 def extract_metadata(file_path: str) -> Dict[str, str]:
@@ -22,62 +85,44 @@ def extract_metadata(file_path: str) -> Dict[str, str]:
     Safe metadata extraction. Never crashes ingestion.
     """
     meta = {"title": "", "author": "", "year": ""}
+
     try:
         doc = fitz.open(file_path)
         md = doc.metadata or {}
-        doc.close()
 
-        title = (md.get("title") or "").strip()
-        author = (md.get("author") or "").strip()
+        meta["title"] = (md.get("title") or "").strip()
+        meta["author"] = (md.get("author") or "").strip()
 
-        # Try to find a year in metadata if present
-        year = ""
+        # Embedded year from metadata date fields
+        embedded_year = ""
         for k in ["creationDate", "modDate"]:
             v = (md.get(k) or "").strip()
-            # PDF date looks like: D:20250101120000
             m = re.search(r"(19|20)\d{2}", v)
             if m:
-                year = m.group(0)
+                embedded_year = m.group(0)
                 break
+        meta["year"] = embedded_year
 
-        meta.update({"title": title, "author": author, "year": year})
+        doc.close()
     except Exception:
-        # keep empty defaults
         pass
+
     return meta
-
-
-def _try_ocr_page(pix: "fitz.Pixmap") -> str:
-    """
-    Best-effort OCR. If tesseract isn't installed, return "" and DO NOT crash.
-    """
-    try:
-        # Import only when needed (prevents hard failure on Render)
-        import pytesseract
-        from PIL import Image
-        from pytesseract import TesseractNotFoundError
-
-        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-        text = pytesseract.image_to_string(img)
-
-        return (text or "").strip()
-    except Exception as e:
-        # Common case on Render: TesseractNotFoundError
-        # We swallow it so ingestion continues with normal text extraction.
-        return ""
 
 
 def read_pdf_chunks(
     file_path: str,
     max_pages: Optional[int] = None,
     min_text_chars_per_page: int = 30,
+    ocr_dpi: int = 250,
 ) -> List[Dict[str, Any]]:
     """
     Reads PDF and returns chunks like:
       { "chunk_id": "chunk_1", "text": "...", "metadata": {"page": 1, ...} }
 
-    Uses PyMuPDF text extraction.
-    OCR is optional and will NEVER crash the pipeline.
+    Strategy:
+    1) Extract normal text
+    2) If OCR enabled and text is short OR low-signal -> OCR the page
     """
     chunks: List[Dict[str, Any]] = []
     doc = fitz.open(file_path)
@@ -91,18 +136,23 @@ def read_pdf_chunks(
 
         text = (page.get_text("text") or "").strip()
 
-        # If OCR enabled AND page has too little text, attempt OCR (best-effort)
-        text = (text or "").strip()
+        should_ocr = False
+        if ENABLE_OCR:
+            if len(text) < min_text_chars_per_page:
+                should_ocr = True
+            elif _looks_like_low_signal_text(text):
+                should_ocr = True
 
-        if ENABLE_OCR and len(text) < min_text_chars_per_page:
-            pix = page.get_pixmap(dpi=200)
-            ocr_text = _try_ocr_page(pix)
-            if ocr_text:
+        if should_ocr:
+            ocr_text = _try_ocr_page(page, dpi=ocr_dpi)
+            # If OCR gave something meaningful, prefer it
+            if ocr_text and len(ocr_text) > len(text):
+                text = ocr_text
+            elif ocr_text and len(text) < 80:
+                # even if not longer, replace tiny junk text
                 text = ocr_text
 
-
         if not text:
-            # skip empty pages
             continue
 
         chunk_id = f"chunk_{page_number}"

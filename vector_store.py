@@ -28,6 +28,7 @@ def _sanitize_doc_ids(doc_ids: List[str]) -> List[str]:
         if not s:
             continue
         out.append(s)
+
     # dedupe while preserving order
     seen = set()
     final: List[str] = []
@@ -40,13 +41,6 @@ def _sanitize_doc_ids(doc_ids: List[str]) -> List[str]:
 
 
 def _normalize_text_for_dedupe(text: str) -> str:
-    """
-    Normalize chunk text to dedupe across duplicate PDFs or repeated slides.
-    Keeps it simple & fast:
-    - lowercase
-    - collapse whitespace
-    - strip
-    """
     if not text:
         return ""
     t = text.lower()
@@ -56,10 +50,6 @@ def _normalize_text_for_dedupe(text: str) -> str:
 
 
 def _chunk_fingerprint(text: str, max_chars: int = 220) -> str:
-    """
-    Hash-like fingerprint (string) for dedupe without importing hashlib.
-    Uses normalized prefix which is usually enough for slide chunks.
-    """
     norm = _normalize_text_for_dedupe(text)
     if not norm:
         return ""
@@ -93,11 +83,7 @@ class StoredDocument:
 class VectorStore:
     """
     Simple in-memory vector store with disk persistence.
-    Phase 3 adds document-aware retrieval with:
-      - balanced top_k_per_doc
-      - optional prefer_first_pages boost (pages 1-2)
-      - cross-doc dedupe
-      - doc_id sanitization
+    Also supports delete-by-doc and delete-by-filename safely (keeps embeddings aligned).
     """
 
     def __init__(self, persist_dir: str = "data"):
@@ -135,7 +121,7 @@ class VectorStore:
         else:
             self._documents = {}
 
-        # ✅ Repair mode: if documents.json is missing/broken but chunks exist
+        # Repair: if docs missing but chunks exist
         if (not self._documents) and self._chunks:
             self._rebuild_documents_from_chunks()
             self.persist()
@@ -152,7 +138,6 @@ class VectorStore:
 
     def _rebuild_documents_from_chunks(self) -> None:
         docs: Dict[str, Dict[str, Any]] = {}
-
         for ch in self._chunks:
             doc_id = ch.document_id
             md = ch.metadata or {}
@@ -166,8 +151,65 @@ class VectorStore:
                     "file_path": md.get("file_path") or "",
                     "pages": int(md.get("total_pages") or 0),
                 }
-
         self._documents = {k: StoredDocument(**v) for k, v in docs.items()}
+
+    # -----------------------------
+    # Delete helpers (keeps embeddings aligned)
+    # -----------------------------
+    def _delete_chunk_indexes(self, indexes: List[int]) -> None:
+        if not indexes:
+            return
+
+        idx_set = set(int(i) for i in indexes)
+        if not idx_set:
+            return
+
+        # Remove chunks
+        new_chunks: List[StoredChunk] = []
+        for i, ch in enumerate(self._chunks):
+            if i in idx_set:
+                continue
+            new_chunks.append(ch)
+        self._chunks = new_chunks
+
+        # Remove embedding rows
+        if self._embeddings is not None and self._embeddings.shape[0] > 0:
+            n = self._embeddings.shape[0]
+            keep_mask = np.ones(n, dtype=bool)
+            for i in idx_set:
+                if 0 <= i < n:
+                    keep_mask[i] = False
+            self._embeddings = self._embeddings[keep_mask, :]
+
+    def remove_document(self, document_id: str) -> bool:
+        document_id = str(document_id).strip()
+        if not document_id:
+            return False
+
+        idxs = [i for i, ch in enumerate(self._chunks) if ch.document_id == document_id]
+        removed_any = bool(idxs)
+
+        self._delete_chunk_indexes(idxs)
+
+        if document_id in self._documents:
+            del self._documents[document_id]
+            removed_any = True
+
+        if removed_any:
+            self.persist()
+        return removed_any
+
+    def remove_document_by_filename(self, filename: str) -> List[str]:
+        fn = (filename or "").strip()
+        if not fn:
+            return []
+
+        to_remove = [d.document_id for d in self._documents.values() if d.filename == fn]
+        removed: List[str] = []
+        for doc_id in to_remove:
+            if self.remove_document(doc_id):
+                removed.append(doc_id)
+        return removed
 
     # -----------------------------
     # Add / List
@@ -188,7 +230,7 @@ class VectorStore:
             self._embeddings = np.vstack([self._embeddings, emb_np])
 
         self.persist()
-        print(f"✅ Added document {doc.document_id} with {len(chunks)} chunks (total chunks: {len(self._chunks)})")
+        print(f"✅ Added document {doc.document_id} with {len(chunks)} chunks (total: {len(self._chunks)})")
 
     def list_documents(self) -> List[StoredDocument]:
         return list(self._documents.values())
@@ -213,14 +255,8 @@ class VectorStore:
         sims = _cosine_sim_matrix(q, self._embeddings)
         idx = np.argsort(-sims)[:top_k]
 
-        out: List[Tuple[StoredChunk, float]] = []
-        for i in idx:
-            out.append((self._chunks[int(i)], float(sims[int(i)])))
-        return out
+        return [(self._chunks[int(i)], float(sims[int(i)])) for i in idx]
 
-    # -----------------------------
-    # Phase 3: Search within ONE document
-    # -----------------------------
     def search_in_document(
         self, query_embedding: List[float], document_id: str, top_k: int = 5
     ) -> List[Tuple[StoredChunk, float]]:
@@ -247,132 +283,48 @@ class VectorStore:
         return out
 
     # -----------------------------
-    # Phase 3 Helper: get chunks from first pages (1-2)
+    # Cross-doc search
     # -----------------------------
-    def get_first_page_chunks(
-        self,
-        document_id: str,
-        pages: Tuple[int, ...] = (1, 2),
-        max_chunks: int = 4,
-    ) -> List[Tuple[StoredChunk, float]]:
-        """
-        Returns chunks from the first pages of a document.
-        Score is set to 0.0 (these are "boost" evidence, not similarity-ranked).
-        """
-        document_id = str(document_id).strip()
-        if not document_id:
-            return []
-
-        hits: List[Tuple[StoredChunk, float]] = []
-        for ch in self._chunks:
-            if ch.document_id != document_id:
-                continue
-            if not ch.pages:
-                continue
-            if any(p in pages for p in ch.pages):
-                hits.append((ch, 0.0))
-
-        # Keep stable + limited
-        return hits[:max_chunks]
-
-    # -----------------------------
-    # Phase 3 Helper: dedupe results by text fingerprint
-    # -----------------------------
-    def dedupe_results(
-        self,
-        results: List[Tuple[StoredChunk, float]],
-        keep: str = "highest_score",
-    ) -> List[Tuple[StoredChunk, float]]:
-        """
-        Dedupe across documents when the same slide/chunk content appears multiple times.
-        keep:
-          - "highest_score": keep the highest similarity item
-          - "first": keep first occurrence
-        """
+    def dedupe_results(self, results: List[Tuple[StoredChunk, float]]) -> List[Tuple[StoredChunk, float]]:
         if not results:
             return []
 
-        buckets: Dict[str, List[Tuple[StoredChunk, float]]] = {}
+        buckets: Dict[str, Tuple[StoredChunk, float]] = {}
         order: List[str] = []
 
         for ch, score in results:
             fp = _chunk_fingerprint(ch.text)
             if not fp:
-                # if empty, treat as unique
                 fp = f"__empty__::{ch.document_id}::{ch.chunk_id}"
             if fp not in buckets:
-                buckets[fp] = []
                 order.append(fp)
-            buckets[fp].append((ch, score))
-
-        deduped: List[Tuple[StoredChunk, float]] = []
-        for fp in order:
-            items = buckets[fp]
-            if not items:
-                continue
-            if keep == "first":
-                deduped.append(items[0])
+                buckets[fp] = (ch, score)
             else:
-                # highest_score
-                best = max(items, key=lambda x: x[1])
-                deduped.append(best)
+                # keep highest score
+                if score > buckets[fp][1]:
+                    buckets[fp] = (ch, score)
 
-        return deduped
+        return [buckets[k] for k in order]
 
-    # -----------------------------
-    # Phase 3: Search across multiple docs (balanced + boosted + deduped)
-    # -----------------------------
     def search_across_documents(
         self,
         query_embedding: List[float],
         document_ids: List[str],
         top_k_per_doc: int = 3,
-        prefer_first_pages: bool = False,
-        first_pages: Tuple[int, ...] = (1, 2),
-        first_page_extra_per_doc: int = 3,
         dedupe: bool = True,
-        return_used_doc_ids: bool = False,
-    ) -> Union[List[Tuple[StoredChunk, float]], Tuple[List[Tuple[StoredChunk, float]], List[str]]]:
-        """
-        Balanced retrieval across docs:
-          - pulls top_k_per_doc from each document
-          - optionally boosts identity by adding some chunks from pages 1-2 per doc
-          - optional dedupe to avoid repeated evidence across docs
-          - optional return_used_doc_ids for debugging/reporting
-        """
+    ) -> List[Tuple[StoredChunk, float]]:
         doc_ids = _sanitize_doc_ids(document_ids)
-
         results: List[Tuple[StoredChunk, float]] = []
-        used_doc_ids: List[str] = []
 
         for doc_id in doc_ids:
-            doc_hits = self.search_in_document(query_embedding, doc_id, top_k=top_k_per_doc)
-            if doc_hits:
-                used_doc_ids.append(doc_id)
-                results.extend(doc_hits)
+            results.extend(self.search_in_document(query_embedding, doc_id, top_k=top_k_per_doc))
 
-            if prefer_first_pages:
-                first_hits = self.get_first_page_chunks(
-                    document_id=doc_id,
-                    pages=first_pages,
-                    max_chunks=first_page_extra_per_doc,
-                )
-                if first_hits:
-                    # even if similarity had nothing, we might still include first pages
-                    if doc_id not in used_doc_ids:
-                        used_doc_ids.append(doc_id)
-                    results.extend(first_hits)
-
-        # Sort by similarity score first (boost chunks score=0.0 will naturally float lower)
         results.sort(key=lambda x: x[1], reverse=True)
 
-        # Dedupe repeated chunks across docs (same text)
         if dedupe:
-            results = self.dedupe_results(results, keep="highest_score")
+            results = self.dedupe_results(results)
             results.sort(key=lambda x: x[1], reverse=True)
 
-        if return_used_doc_ids:
-            return results, used_doc_ids
         return results
 
 
