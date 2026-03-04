@@ -13,7 +13,7 @@ export interface Message {
   id: string;
   role: 'user' | 'assistant';
   content: string;
-  sources?: string[];  // ADD THIS LINE
+  citations?: any[]
   timestamp: number;
 }
 

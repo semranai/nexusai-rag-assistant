@@ -226,16 +226,20 @@ const App: React.FC = () => {
       }
 
       const data = await response.json();
-      const answer = data?.answer ?? "No answer returned.";
-      const citations = Array.isArray(data?.citations) ? data.citations : [];
 
-      const assistantMsg: Message = {
-        id: (Date.now() + 1).toString(),
-        role: 'assistant',
-        content: answer || "No response received",
-        sources: citations || [],
-        timestamp: Date.now()
-      };
+const answer = typeof data?.answer === "string"
+  ? data.answer
+  : JSON.stringify(data?.answer ?? "");
+
+const citations = Array.isArray(data?.citations) ? data.citations : [];
+
+const assistantMsg: Message = {
+  id: (Date.now() + 1).toString(),
+  role: "assistant",
+  content: answer || "No response received",
+  citations: citations,
+  timestamp: Date.now()
+};
 
       setMessages(prev => [...prev, assistantMsg]);
 
