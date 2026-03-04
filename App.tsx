@@ -226,12 +226,14 @@ const App: React.FC = () => {
       }
 
       const data = await response.json();
+      const answer = data?.answer ?? "No answer returned.";
+      const citations = Array.isArray(data?.citations) ? data.citations : [];
 
       const assistantMsg: Message = {
         id: (Date.now() + 1).toString(),
         role: 'assistant',
-        content: data.answer || "No response received",
-        sources: data.citations || [],
+        content: answer || "No response received",
+        sources: citations || [],
         timestamp: Date.now()
       };
 
