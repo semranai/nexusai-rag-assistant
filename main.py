@@ -2,24 +2,16 @@
 import os
 import re
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import fitz  # PyMuPDF
-from fastapi import FastAPI, File, UploadFile, Query
+from fastapi import FastAPI, File, UploadFile, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from pdf_loader import extract_metadata, read_pdf_chunks
 from embeddings import embedder
-
-# ✅ Safe import so uvicorn never crashes even if vector_store import is partially broken
-try:
-    from vector_store import StoredChunk, StoredDocument, vector_store
-except Exception:
-    from vector_store import vector_store  # type: ignore
-    StoredChunk = None  # type: ignore
-    StoredDocument = None  # type: ignore
-
+from vector_store import StoredChunk, StoredDocument, vector_store
 from answer_generator import (
     generate_answer,
     generate_comparison_answer,
@@ -29,8 +21,13 @@ from answer_generator import (
 ENABLE_OCR = os.getenv("ENABLE_OCR", "false").strip().lower() == "true"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Where PDFs are stored
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", os.path.join(BASE_DIR, "uploaded_pdfs"))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Where vector DB is stored (same env var you use in vector_store.py)
+VECTOR_DB_DIR = os.getenv("VECTOR_DB_DIR", "data")
 
 
 # -----------------------------
@@ -55,7 +52,7 @@ class QueryDocsRequest(BaseModel):
 
 class CompareRequest(BaseModel):
     question: str
-    doc_ids: Optional[List[str]] = None
+    doc_ids: Optional[List[str]] = None  # if None -> compare across ALL docs
     top_k_per_doc: int = 3
 
 
@@ -68,7 +65,7 @@ app = FastAPI(title="NexusAI RAG Assistant", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # ok for local dev; tighten for prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -89,7 +86,7 @@ _last_ingest_error: Optional[str] = None
 
 
 # -----------------------------
-# Metadata override helpers
+# Metadata override helpers (slide-text based)
 # -----------------------------
 def _extract_presenter(text: str) -> str:
     if not text:
@@ -114,11 +111,6 @@ def _extract_chapter_title_line(text: str) -> str:
     m2 = re.search(r"(Chapter\s*\d+\s*:\s*)\s*[\r\n]+([^\n\r]+)", text, flags=re.IGNORECASE)
     if m2:
         return f"{m2.group(1).strip()} {m2.group(2).strip()}".strip()
-
-    # fallback: just "Chapter 3"
-    m3 = re.search(r"\b(Chapter\s*\d+)\b", text, flags=re.IGNORECASE)
-    if m3:
-        return m3.group(1).strip()
 
     return ""
 
@@ -191,102 +183,32 @@ def _pdf_page_count(pdf_path: str) -> int:
         return 0
 
 
-def _is_formula_question(q: str) -> bool:
-    ql = (q or "").lower()
-    triggers = [
-        "equation", "equations", "formula", "formulas",
-        "likelihood", "log-likelihood", "log likelihood",
-        "e-step", "m-step", "em algorithm", "expectation maximization",
-        "derivation", "proof",
-    ]
-    return any(t in ql for t in triggers)
-
-
-def _extract_keywords_for_fallback(q: str) -> List[str]:
+def _safe_remove_file(path: str) -> bool:
     """
-    Pull key tokens from question for lexical fallback.
+    Best-effort file delete. Returns True if deleted, False if not.
     """
-    ql = (q or "").lower()
-    # Keep only meaningful tokens
-    raw = re.findall(r"[a-zA-Z][a-zA-Z\-]{2,}", ql)
-    stop = {
-        "what", "is", "the", "a", "an", "and", "or", "to", "of", "in", "from",
-        "write", "include", "give", "me", "chapter", "document", "explain"
-    }
-    toks = [t for t in raw if t not in stop]
-    # add some domain anchors if it looks like math
-    if _is_formula_question(q):
-        toks += ["log", "likelihood", "maximize", "expectation", "posterior", "theta", "pi", "mu", "sigma", "gamma"]
-    # dedupe
-    seen = set()
-    out = []
-    for t in toks:
-        if t in seen:
-            continue
-        seen.add(t)
-        out.append(t)
-    return out[:12]
+    try:
+        if path and os.path.exists(path) and os.path.isfile(path):
+            os.remove(path)
+            return True
+    except Exception:
+        pass
+    return False
 
 
-def _keyword_fallback_chunks(
-    question: str,
-    candidate_chunks: List[Dict[str, Any]],
-    extra_pool: List[Dict[str, Any]],
-    take: int = 8,
-) -> List[Dict[str, Any]]:
-    """
-    If embeddings miss equations, do a simple keyword scoring over a bigger pool.
-    """
-    keywords = _extract_keywords_for_fallback(question)
-    if not keywords:
-        return candidate_chunks
-
-    def score_text(text: str) -> int:
-        t = (text or "").lower()
-        s = 0
-        for kw in keywords:
-            if kw in t:
-                s += 1
-        # boost if it looks like a formula slide
-        if re.search(r"[=∑Σ∫πμσθ]|log\s*\(|p\s*\(", text or ""):
-            s += 2
-        return s
-
-    pool = (candidate_chunks or []) + (extra_pool or [])
-    # dedupe by chunk_id
-    seen_ids = set()
-    uniq = []
-    for c in pool:
-        cid = c.get("chunk_id")
-        if cid in seen_ids:
-            continue
-        seen_ids.add(cid)
-        uniq.append(c)
-
-    ranked = sorted(uniq, key=lambda c: score_text(c.get("text", "")), reverse=True)
-    best = [c for c in ranked if score_text(c.get("text", "")) > 0][:take]
-
-    # If fallback found something good, merge into front
-    if best:
-        merged = best + [c for c in candidate_chunks if c.get("chunk_id") not in {b.get("chunk_id") for b in best}]
-        return merged[: max(len(candidate_chunks), take)]
-    return candidate_chunks
-
-
-# -----------------------------
-# Ingestion
-# -----------------------------
 def _ingest_one_pdf(pdf_path: str, force_reingest: bool = False) -> None:
     global _last_ingest_error
 
     try:
         filename = os.path.basename(pdf_path)
 
+        # ✅ If force_reingest, delete any existing doc(s) with the same filename (vector store only)
         if force_reingest:
-            removed_ids = vector_store.remove_document_by_filename(filename)  # type: ignore
+            removed_ids = vector_store.remove_document_by_filename(filename)
             if removed_ids:
                 print(f"🧹 Removed existing docs for {filename}: {removed_ids}")
 
+        # If not forcing, keep the skip behavior
         if not force_reingest:
             existing = [d for d in vector_store.list_documents() if d.filename == filename]
             if existing:
@@ -296,6 +218,7 @@ def _ingest_one_pdf(pdf_path: str, force_reingest: bool = False) -> None:
         total_pages = _pdf_page_count(pdf_path)
 
         chunks_raw = read_pdf_chunks(file_path=pdf_path)
+
         if not chunks_raw:
             print(f"⚠️ Ingestion: PDF produced 0 chunks: {filename}")
             return
@@ -304,7 +227,7 @@ def _ingest_one_pdf(pdf_path: str, force_reingest: bool = False) -> None:
         meta = _override_meta_from_first_page(meta, chunks_raw, filename)
 
         texts: List[str] = []
-        stored_chunks: List[Any] = []
+        stored_chunks: List[StoredChunk] = []
 
         for c in chunks_raw:
             text = c.get("text", "") or ""
@@ -317,52 +240,43 @@ def _ingest_one_pdf(pdf_path: str, force_reingest: bool = False) -> None:
             raw_chunk_id = c.get("chunk_id", "unknown_chunk")
             unique_chunk_id = f"{doc_id}_{raw_chunk_id}"
 
-            chunk_obj = {
-                "chunk_id": unique_chunk_id,
-                "text": text,
-                "pages": pages,
-                "document_id": doc_id,
-                "document_title": meta.get("title") or filename,
-                "document_author": meta.get("author") or "Unknown Author",
-                "document_year": meta.get("year") or "",
-                "source_locations": [{"page": page, "location": md.get("location", "")}],
-                "metadata": {
-                    **md,
-                    "page": page,
-                    "document_id": doc_id,
-                    "filename": filename,
-                    "title": meta.get("title") or filename,
-                    "author": meta.get("author") or "Unknown Author",
-                    "year": meta.get("year") or "",
-                    "file_path": pdf_path,
-                    "total_pages": total_pages,
-                },
-            }
-
-            # If StoredChunk dataclass is available, use it; otherwise store dict-like
-            if StoredChunk is not None:
-                stored_chunks.append(StoredChunk(**chunk_obj))  # type: ignore
-            else:
-                stored_chunks.append(chunk_obj)
+            stored_chunks.append(
+                StoredChunk(
+                    chunk_id=unique_chunk_id,
+                    text=text,
+                    pages=pages,
+                    document_id=doc_id,
+                    document_title=meta.get("title") or filename,
+                    document_author=meta.get("author") or "Unknown Author",
+                    document_year=meta.get("year") or "",
+                    source_locations=[{"page": page, "location": md.get("location", "")}],
+                    metadata={
+                        **md,
+                        "page": page,
+                        "document_id": doc_id,
+                        "filename": filename,
+                        "title": meta.get("title") or filename,
+                        "author": meta.get("author") or "Unknown Author",
+                        "year": meta.get("year") or "",
+                        "file_path": pdf_path,
+                        "total_pages": total_pages,
+                    },
+                )
+            )
 
         embeddings = embedder.embed_texts(texts)
 
-        doc_obj = {
-            "document_id": doc_id,
-            "title": meta.get("title") or filename,
-            "author": meta.get("author") or "Unknown Author",
-            "year": meta.get("year") or "",
-            "filename": filename,
-            "file_path": pdf_path,
-            "pages": total_pages,
-        }
+        doc = StoredDocument(
+            document_id=doc_id,
+            title=meta.get("title") or filename,
+            author=meta.get("author") or "Unknown Author",
+            year=meta.get("year") or "",
+            filename=filename,
+            file_path=pdf_path,
+            pages=total_pages,
+        )
 
-        if StoredDocument is not None:
-            doc = StoredDocument(**doc_obj)  # type: ignore
-        else:
-            doc = doc_obj  # type: ignore
-
-        vector_store.add_document(doc, stored_chunks, embeddings)  # type: ignore
+        vector_store.add_document(doc, stored_chunks, embeddings)
         _last_ingest_error = None
 
     except Exception as e:
@@ -372,6 +286,7 @@ def _ingest_one_pdf(pdf_path: str, force_reingest: bool = False) -> None:
 
 def ingest_pdfs(force_reingest: bool = False) -> None:
     vector_store.load()
+
     for name in os.listdir(UPLOAD_DIR):
         if not name.lower().endswith(".pdf"):
             continue
@@ -396,14 +311,14 @@ def _vector_search(question: str, top_k: int) -> List[Dict[str, Any]]:
     for ch, score in results:
         out.append(
             {
-                "chunk_id": getattr(ch, "chunk_id", None) or ch.get("chunk_id"),
-                "text": getattr(ch, "text", None) or ch.get("text"),
+                "chunk_id": ch.chunk_id,
+                "text": ch.text,
                 "score": score,
-                "pages": getattr(ch, "pages", None) or ch.get("pages", []),
-                "document_title": getattr(ch, "document_title", None) or ch.get("document_title"),
-                "document_author": getattr(ch, "document_author", None) or ch.get("document_author"),
-                "document_year": getattr(ch, "document_year", None) or ch.get("document_year"),
-                "metadata": getattr(ch, "metadata", None) or ch.get("metadata", {}),
+                "pages": ch.pages,
+                "document_title": ch.document_title,
+                "document_author": ch.document_author,
+                "document_year": ch.document_year,
+                "metadata": ch.metadata,
             }
         )
     return out
@@ -417,14 +332,14 @@ def _vector_search_in_doc(question: str, document_id: str, top_k: int) -> List[D
     for ch, score in results:
         out.append(
             {
-                "chunk_id": getattr(ch, "chunk_id", None) or ch.get("chunk_id"),
-                "text": getattr(ch, "text", None) or ch.get("text"),
+                "chunk_id": ch.chunk_id,
+                "text": ch.text,
                 "score": score,
-                "pages": getattr(ch, "pages", None) or ch.get("pages", []),
-                "document_title": getattr(ch, "document_title", None) or ch.get("document_title"),
-                "document_author": getattr(ch, "document_author", None) or ch.get("document_author"),
-                "document_year": getattr(ch, "document_year", None) or ch.get("document_year"),
-                "metadata": getattr(ch, "metadata", None) or ch.get("metadata", {}),
+                "pages": ch.pages,
+                "document_title": ch.document_title,
+                "document_author": ch.document_author,
+                "document_year": ch.document_year,
+                "metadata": ch.metadata,
             }
         )
     return out
@@ -438,14 +353,14 @@ def _vector_search_compare(question: str, doc_ids: List[str], top_k_per_doc: int
     for ch, score in results:
         out.append(
             {
-                "chunk_id": getattr(ch, "chunk_id", None) or ch.get("chunk_id"),
-                "text": getattr(ch, "text", None) or ch.get("text"),
+                "chunk_id": ch.chunk_id,
+                "text": ch.text,
                 "score": score,
-                "pages": getattr(ch, "pages", None) or ch.get("pages", []),
-                "document_title": getattr(ch, "document_title", None) or ch.get("document_title"),
-                "document_author": getattr(ch, "document_author", None) or ch.get("document_author"),
-                "document_year": getattr(ch, "document_year", None) or ch.get("document_year"),
-                "metadata": getattr(ch, "metadata", None) or ch.get("metadata", {}),
+                "pages": ch.pages,
+                "document_title": ch.document_title,
+                "document_author": ch.document_author,
+                "document_year": ch.document_year,
+                "metadata": ch.metadata,
             }
         )
     return out
@@ -460,11 +375,9 @@ def _chunks_indexed_count() -> int:
     return 0
 
 
-def _get_doc_by_id(doc_id: str) -> Optional[Any]:
+def _get_doc_by_id(doc_id: str) -> Optional[StoredDocument]:
     for d in vector_store.list_documents():
-        if getattr(d, "document_id", None) == doc_id:
-            return d
-        if isinstance(d, dict) and d.get("document_id") == doc_id:
+        if d.document_id == doc_id:
             return d
     return None
 
@@ -475,6 +388,7 @@ def _get_doc_by_id(doc_id: str) -> Optional[Any]:
 @app.get("/system")
 def system_status() -> Dict[str, Any]:
     docs = vector_store.list_documents()
+
     return {
         "service": "NexusAI RAG Assistant",
         "version": "0.1.0",
@@ -486,13 +400,16 @@ def system_status() -> Dict[str, Any]:
         "docs_ingested": len(docs),
         "chunks_indexed": _chunks_indexed_count(),
         "last_ingest_error": _last_ingest_error,
+        "vector_db_dir": VECTOR_DB_DIR,
     }
 
 
+# ✅ Add query param: /reload?force=true
 @app.post("/reload")
 def reload_index(force: bool = Query(default=False)) -> Dict[str, Any]:
     ingest_pdfs(force_reingest=force)
     docs = vector_store.list_documents()
+
     return {
         "ok": True,
         "force_reingest": force,
@@ -510,36 +427,26 @@ def list_documents() -> List[Dict[str, Any]]:
 
     out: List[Dict[str, Any]] = []
     for d in docs:
-        if isinstance(d, dict):
-            doc_id = d.get("document_id")
-            out.append(
-                {
-                    "document_id": doc_id,
-                    "filename": d.get("filename", ""),
-                    "title": d.get("title", ""),
-                    "author": d.get("author", ""),
-                    "year": d.get("year", ""),
-                    "num_chunks": counts.get(doc_id, 0),
-                    "pages": int(d.get("pages", 0) or 0),
-                }
-            )
-        else:
-            out.append(
-                {
-                    "document_id": d.document_id,
-                    "filename": d.filename,
-                    "title": d.title,
-                    "author": d.author,
-                    "year": d.year,
-                    "num_chunks": counts.get(d.document_id, 0),
-                    "pages": d.pages,
-                }
-            )
+        out.append(
+            {
+                "document_id": d.document_id,
+                "filename": d.filename,
+                "title": d.title,
+                "author": d.author,
+                "year": d.year,
+                "num_chunks": counts.get(d.document_id, 0),
+                "pages": d.pages,
+            }
+        )
     return out
 
 
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...), force: bool = Query(default=True)) -> Dict[str, Any]:
+    """
+    Default force=True: if user uploads a PDF with same filename, replace it (vector store doc with same filename).
+    NOTE: This does NOT delete other PDFs with different names.
+    """
     filename = file.filename or "uploaded.pdf"
     save_path = os.path.join(UPLOAD_DIR, filename)
 
@@ -547,19 +454,43 @@ async def upload_pdf(file: UploadFile = File(...), force: bool = Query(default=T
         f.write(await file.read())
 
     _ingest_one_pdf(save_path, force_reingest=force)
+
     return {"ok": True, "saved_as": filename, "force_reingest": force}
+
+
+# ✅ NEW: Delete a single document (vector + pdf file)
+@app.delete("/documents/{document_id}")
+def delete_document(document_id: str) -> Dict[str, Any]:
+    doc = _get_doc_by_id(document_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="document_id not found")
+
+    # 1) remove from vector store (also persists)
+    removed = vector_store.remove_document(document_id)
+
+    # 2) remove the file from uploaded_pdfs (best-effort)
+    pdf_deleted = False
+    pdf_path = doc.file_path
+
+    # If file_path is missing or wrong, fallback to UPLOAD_DIR/filename
+    if (not pdf_path) or (not os.path.exists(pdf_path)):
+        pdf_path = os.path.join(UPLOAD_DIR, doc.filename)
+
+    pdf_deleted = _safe_remove_file(pdf_path)
+
+    return {
+        "ok": True,
+        "document_id": document_id,
+        "removed_from_vector_store": bool(removed),
+        "pdf_deleted": bool(pdf_deleted),
+        "pdf_path": pdf_path,
+        "filename": doc.filename,
+    }
 
 
 @app.post("/query")
 def query_docs(req: QueryRequest) -> Dict[str, Any]:
-    # get embedding results
     chunks = _vector_search(req.question, top_k=max(1, int(req.top_k)))
-
-    # keyword fallback pool: fetch more candidates when formulas requested
-    if _is_formula_question(req.question):
-        extra_pool = _vector_search(req.question, top_k=max(20, int(req.top_k) * 6))
-        chunks = _keyword_fallback_chunks(req.question, chunks, extra_pool, take=10)
-
     result = generate_answer(req.question, chunks, chat_model=os.getenv("CHAT_MODEL", "gpt-4o-mini"))
     return {
         "question": req.question,
@@ -572,13 +503,7 @@ def query_docs(req: QueryRequest) -> Dict[str, Any]:
 @app.post("/query_doc")
 def query_one_doc(req: QueryDocRequest) -> Dict[str, Any]:
     docs = vector_store.list_documents()
-    all_ids = set()
-    for d in docs:
-        if isinstance(d, dict):
-            all_ids.add(d.get("document_id"))
-        else:
-            all_ids.add(d.document_id)
-
+    all_ids = {d.document_id for d in docs}
     if req.document_id not in all_ids:
         return {
             "question": req.question,
@@ -590,11 +515,6 @@ def query_one_doc(req: QueryDocRequest) -> Dict[str, Any]:
         }
 
     chunks = _vector_search_in_doc(req.question, req.document_id, top_k=max(1, int(req.top_k)))
-
-    if _is_formula_question(req.question):
-        extra_pool = _vector_search_in_doc(req.question, req.document_id, top_k=max(25, int(req.top_k) * 6))
-        chunks = _keyword_fallback_chunks(req.question, chunks, extra_pool, take=12)
-
     result = generate_answer(req.question, chunks, chat_model=os.getenv("CHAT_MODEL", "gpt-4o-mini"))
     return {
         "question": req.question,
@@ -608,10 +528,7 @@ def query_one_doc(req: QueryDocRequest) -> Dict[str, Any]:
 @app.post("/query_docs")
 def query_multiple_docs(req: QueryDocsRequest) -> Dict[str, Any]:
     docs = vector_store.list_documents()
-    all_ids = set()
-    for d in docs:
-        all_ids.add(d.get("document_id") if isinstance(d, dict) else d.document_id)
-
+    all_ids = {d.document_id for d in docs}
     doc_ids = [d for d in req.doc_ids if d in all_ids]
 
     if not doc_ids:
@@ -624,12 +541,6 @@ def query_multiple_docs(req: QueryDocsRequest) -> Dict[str, Any]:
         }
 
     chunks = _vector_search_compare(req.question, doc_ids, top_k_per_doc=max(1, int(req.top_k_per_doc)))
-
-    # for formulas, add a bigger cross-doc pool and rerank by keywords
-    if _is_formula_question(req.question):
-        big_pool = _vector_search_compare(req.question, doc_ids, top_k_per_doc=max(8, int(req.top_k_per_doc) * 4))
-        chunks = _keyword_fallback_chunks(req.question, chunks, big_pool, take=14)
-
     result = generate_answer(req.question, chunks, chat_model=os.getenv("CHAT_MODEL", "gpt-4o-mini"))
     return {
         "question": req.question,
@@ -643,7 +554,7 @@ def query_multiple_docs(req: QueryDocsRequest) -> Dict[str, Any]:
 @app.post("/compare")
 def compare_docs(req: CompareRequest) -> Dict[str, Any]:
     docs = vector_store.list_documents()
-    all_ids = [d.get("document_id") if isinstance(d, dict) else d.document_id for d in docs]
+    all_ids = [d.document_id for d in docs]
 
     doc_ids = req.doc_ids if req.doc_ids else all_ids
     doc_ids = [d for d in doc_ids if d in all_ids]
@@ -658,7 +569,6 @@ def compare_docs(req: CompareRequest) -> Dict[str, Any]:
         }
 
     chunks = _vector_search_compare(req.question, doc_ids, top_k_per_doc=max(1, int(req.top_k_per_doc)))
-
     result = generate_comparison_answer(req.question, chunks, chat_model=os.getenv("CHAT_MODEL", "gpt-4o-mini"))
 
     return {
@@ -692,11 +602,15 @@ def summarize_one_doc(req: SummarizeDocRequest) -> Dict[str, Any]:
         "Keep it concise and cite pages."
     )
 
-    chunks = _vector_search_in_doc(summary_prompt, req.document_id, top_k=25)
+    chunks = _vector_search_in_doc(summary_prompt, req.document_id, top_k=20)
 
-    # extra help for formula-heavy docs
-    extra_pool = _vector_search_in_doc("equation formula likelihood log-likelihood derivation", req.document_id, top_k=35)
-    chunks = _keyword_fallback_chunks("formula equation likelihood log-likelihood", chunks, extra_pool, take=14)
+    if not chunks:
+        anchor_q = f"{doc.title} {doc.filename} main topics key concepts"
+        chunks = _vector_search_in_doc(anchor_q, req.document_id, top_k=25)
+
+    if not chunks:
+        anchor_q2 = "Presented by Chapter Transformer attention encoder decoder"
+        chunks = _vector_search_in_doc(anchor_q2, req.document_id, top_k=25)
 
     result = generate_answer(summary_prompt, chunks, chat_model=os.getenv("CHAT_MODEL", "gpt-4o-mini"))
     summary = result.get("answer", INSUFFICIENT_MSG) or INSUFFICIENT_MSG
@@ -710,4 +624,64 @@ def summarize_one_doc(req: SummarizeDocRequest) -> Dict[str, Any]:
         "summary": summary,
         "citations": result.get("citations", []),
         "evidence": result.get("evidence", []),
+    }
+
+
+# ✅ NEW: Clear ALL docs + PDFs (DEV reset button)
+@app.post("/clear")
+def clear_all(
+    confirm: bool = Query(default=False, description="Must be true to clear everything."),
+    delete_vectors: bool = Query(default=True, description="Also delete vector DB files on disk."),
+) -> Dict[str, Any]:
+    """
+    Clears all documents + PDFs. Useful for online/dev when storage gets messy.
+
+    confirm=true is required so you don't wipe things accidentally.
+    """
+    if not confirm:
+        raise HTTPException(status_code=400, detail="Pass confirm=true to clear all data.")
+
+    # 1) Remove docs from vector store
+    docs = vector_store.list_documents()
+    removed_doc_ids: List[str] = []
+    for d in docs:
+        if vector_store.remove_document(d.document_id):
+            removed_doc_ids.append(d.document_id)
+
+    # 2) Delete all PDFs in upload dir
+    deleted_pdfs: List[str] = []
+    failed_pdfs: List[str] = []
+    try:
+        for name in os.listdir(UPLOAD_DIR):
+            if not name.lower().endswith(".pdf"):
+                continue
+            p = os.path.join(UPLOAD_DIR, name)
+            if _safe_remove_file(p):
+                deleted_pdfs.append(name)
+            else:
+                failed_pdfs.append(name)
+    except Exception as e:
+        failed_pdfs.append(f"UPLOAD_DIR_ERROR: {e}")
+
+    # 3) Optionally delete vector DB files on disk (hard reset)
+    deleted_vector_files: List[str] = []
+    if delete_vectors:
+        candidates = [
+            os.path.join(VECTOR_DB_DIR, "chunks.json"),
+            os.path.join(VECTOR_DB_DIR, "documents.json"),
+            os.path.join(VECTOR_DB_DIR, "embeddings.npy"),
+        ]
+        for fp in candidates:
+            if _safe_remove_file(fp):
+                deleted_vector_files.append(fp)
+
+        # Reload empty store after deleting files
+        vector_store.load()
+
+    return {
+        "ok": True,
+        "removed_doc_ids": removed_doc_ids,
+        "deleted_pdfs": deleted_pdfs,
+        "failed_pdfs": failed_pdfs,
+        "deleted_vector_files": deleted_vector_files,
     }
