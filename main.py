@@ -18,17 +18,9 @@ from answer_generator import (
     INSUFFICIENT_MSG,
 )
 
-ENABLE_OCR = os.getenv("ENABLE_OCR", "false").strip().lower() == "true"
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Where PDFs are stored
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", os.path.join(BASE_DIR, "uploaded_pdfs"))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-# Where vector DB is stored (same env var you use in vector_store.py)
-VECTOR_DB_DIR = os.getenv("VECTOR_DB_DIR", "data")
-
 
 # -----------------------------
 # Request Schemas
@@ -52,7 +44,7 @@ class QueryDocsRequest(BaseModel):
 
 class CompareRequest(BaseModel):
     question: str
-    doc_ids: Optional[List[str]] = None  # if None -> compare across ALL docs
+    doc_ids: Optional[List[str]] = None
     top_k_per_doc: int = 3
 
 
@@ -65,11 +57,13 @@ app = FastAPI(title="NexusAI RAG Assistant", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ok for local dev; tighten for prod
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_last_ingest_error: Optional[str] = None
 
 
 @app.get("/")
@@ -82,11 +76,8 @@ def root():
     }
 
 
-_last_ingest_error: Optional[str] = None
-
-
 # -----------------------------
-# Metadata override helpers (slide-text based)
+# Metadata override helpers
 # -----------------------------
 def _extract_presenter(text: str) -> str:
     if not text:
@@ -183,17 +174,18 @@ def _pdf_page_count(pdf_path: str) -> int:
         return 0
 
 
-def _safe_remove_file(path: str) -> bool:
-    """
-    Best-effort file delete. Returns True if deleted, False if not.
-    """
-    try:
-        if path and os.path.exists(path) and os.path.isfile(path):
-            os.remove(path)
-            return True
-    except Exception:
-        pass
-    return False
+def _make_metadata_chunk_text(meta: Dict[str, str], filename: str) -> str:
+    title = (meta.get("title") or "").strip() or filename
+    author = (meta.get("author") or "").strip() or "Unknown Author"
+    year = (meta.get("year") or "").strip() or "n.d."
+    # Keep this “document facts” chunk short + searchable
+    return (
+        "DOCUMENT METADATA\n"
+        f"Title: {title}\n"
+        f"Author/Presenter: {author}\n"
+        f"Year: {year}\n"
+        f"Filename: {filename}\n"
+    )
 
 
 def _ingest_one_pdf(pdf_path: str, force_reingest: bool = False) -> None:
@@ -202,13 +194,11 @@ def _ingest_one_pdf(pdf_path: str, force_reingest: bool = False) -> None:
     try:
         filename = os.path.basename(pdf_path)
 
-        # ✅ If force_reingest, delete any existing doc(s) with the same filename (vector store only)
         if force_reingest:
             removed_ids = vector_store.remove_document_by_filename(filename)
             if removed_ids:
                 print(f"🧹 Removed existing docs for {filename}: {removed_ids}")
 
-        # If not forcing, keep the skip behavior
         if not force_reingest:
             existing = [d for d in vector_store.list_documents() if d.filename == filename]
             if existing:
@@ -218,7 +208,6 @@ def _ingest_one_pdf(pdf_path: str, force_reingest: bool = False) -> None:
         total_pages = _pdf_page_count(pdf_path)
 
         chunks_raw = read_pdf_chunks(file_path=pdf_path)
-
         if not chunks_raw:
             print(f"⚠️ Ingestion: PDF produced 0 chunks: {filename}")
             return
@@ -229,6 +218,34 @@ def _ingest_one_pdf(pdf_path: str, force_reingest: bool = False) -> None:
         texts: List[str] = []
         stored_chunks: List[StoredChunk] = []
 
+        # ✅ Add synthetic metadata chunk so author/title/year questions always have evidence
+        meta_text = _make_metadata_chunk_text(meta, filename)
+        texts.append(meta_text)
+        stored_chunks.append(
+            StoredChunk(
+                chunk_id=f"{doc_id}_meta",
+                text=meta_text,
+                pages=[1],
+                document_id=doc_id,
+                document_title=meta.get("title") or filename,
+                document_author=meta.get("author") or "Unknown Author",
+                document_year=meta.get("year") or "",
+                source_locations=[{"page": 1, "location": "Metadata"}],
+                metadata={
+                    "page": 1,
+                    "document_id": doc_id,
+                    "filename": filename,
+                    "title": meta.get("title") or filename,
+                    "author": meta.get("author") or "Unknown Author",
+                    "year": meta.get("year") or "",
+                    "file_path": pdf_path,
+                    "total_pages": total_pages,
+                    "chunk_type": "document_metadata",
+                },
+            )
+        )
+
+        # Normal page chunks
         for c in chunks_raw:
             text = c.get("text", "") or ""
             md = c.get("metadata") or {}
@@ -382,6 +399,16 @@ def _get_doc_by_id(doc_id: str) -> Optional[StoredDocument]:
     return None
 
 
+def _best_effort_persist_vector_store() -> None:
+    for meth in ("save", "persist", "dump", "flush"):
+        fn = getattr(vector_store, meth, None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+
+
 # -----------------------------
 # API Endpoints
 # -----------------------------
@@ -400,11 +427,9 @@ def system_status() -> Dict[str, Any]:
         "docs_ingested": len(docs),
         "chunks_indexed": _chunks_indexed_count(),
         "last_ingest_error": _last_ingest_error,
-        "vector_db_dir": VECTOR_DB_DIR,
     }
 
 
-# ✅ Add query param: /reload?force=true
 @app.post("/reload")
 def reload_index(force: bool = Query(default=False)) -> Dict[str, Any]:
     ingest_pdfs(force_reingest=force)
@@ -443,10 +468,6 @@ def list_documents() -> List[Dict[str, Any]]:
 
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...), force: bool = Query(default=True)) -> Dict[str, Any]:
-    """
-    Default force=True: if user uploads a PDF with same filename, replace it (vector store doc with same filename).
-    NOTE: This does NOT delete other PDFs with different names.
-    """
     filename = file.filename or "uploaded.pdf"
     save_path = os.path.join(UPLOAD_DIR, filename)
 
@@ -458,33 +479,65 @@ async def upload_pdf(file: UploadFile = File(...), force: bool = Query(default=T
     return {"ok": True, "saved_as": filename, "force_reingest": force}
 
 
-# ✅ NEW: Delete a single document (vector + pdf file)
 @app.delete("/documents/{document_id}")
 def delete_document(document_id: str) -> Dict[str, Any]:
     doc = _get_doc_by_id(document_id)
     if not doc:
-        raise HTTPException(status_code=404, detail="document_id not found")
+        raise HTTPException(status_code=404, detail=f"document_id not found: {document_id}")
 
-    # 1) remove from vector store (also persists)
-    removed = vector_store.remove_document(document_id)
+    print(f"🗑️ Deleting document_id={document_id} filename={doc.filename}")
 
-    # 2) remove the file from uploaded_pdfs (best-effort)
-    pdf_deleted = False
-    pdf_path = doc.file_path
+    removed = bool(vector_store.remove_document(document_id))
+    _best_effort_persist_vector_store()
 
-    # If file_path is missing or wrong, fallback to UPLOAD_DIR/filename
-    if (not pdf_path) or (not os.path.exists(pdf_path)):
-        pdf_path = os.path.join(UPLOAD_DIR, doc.filename)
-
-    pdf_deleted = _safe_remove_file(pdf_path)
+    file_deleted = False
+    file_path = getattr(doc, "file_path", "") or ""
+    try:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+            file_deleted = True
+            print(f"✅ Deleted PDF from disk: {file_path}")
+    except Exception as e:
+        print(f"⚠️ Failed to delete PDF on disk: {file_path} err={e}")
 
     return {
         "ok": True,
+        "deleted": removed,
         "document_id": document_id,
-        "removed_from_vector_store": bool(removed),
-        "pdf_deleted": bool(pdf_deleted),
-        "pdf_path": pdf_path,
         "filename": doc.filename,
+        "file_deleted": file_deleted,
+        "file_path": file_path,
+    }
+
+
+@app.post("/clear")
+def clear_all() -> Dict[str, Any]:
+    print("🧹 Clearing all documents and PDFs...")
+
+    doc_ids = [d.document_id for d in vector_store.list_documents()]
+    removed_count = 0
+    for did in doc_ids:
+        if vector_store.remove_document(did):
+            removed_count += 1
+    _best_effort_persist_vector_store()
+
+    deleted_files = 0
+    for name in os.listdir(UPLOAD_DIR):
+        if not name.lower().endswith(".pdf"):
+            continue
+        try:
+            os.remove(os.path.join(UPLOAD_DIR, name))
+            deleted_files += 1
+        except Exception:
+            pass
+
+    return {
+        "ok": True,
+        "documents_removed": removed_count,
+        "pdf_files_deleted": deleted_files,
+        "upload_dir": UPLOAD_DIR,
+        "docs_ingested": len(vector_store.list_documents()),
+        "chunks_indexed": _chunks_indexed_count(),
     }
 
 
@@ -608,10 +661,6 @@ def summarize_one_doc(req: SummarizeDocRequest) -> Dict[str, Any]:
         anchor_q = f"{doc.title} {doc.filename} main topics key concepts"
         chunks = _vector_search_in_doc(anchor_q, req.document_id, top_k=25)
 
-    if not chunks:
-        anchor_q2 = "Presented by Chapter Transformer attention encoder decoder"
-        chunks = _vector_search_in_doc(anchor_q2, req.document_id, top_k=25)
-
     result = generate_answer(summary_prompt, chunks, chat_model=os.getenv("CHAT_MODEL", "gpt-4o-mini"))
     summary = result.get("answer", INSUFFICIENT_MSG) or INSUFFICIENT_MSG
 
@@ -624,64 +673,4 @@ def summarize_one_doc(req: SummarizeDocRequest) -> Dict[str, Any]:
         "summary": summary,
         "citations": result.get("citations", []),
         "evidence": result.get("evidence", []),
-    }
-
-
-# ✅ NEW: Clear ALL docs + PDFs (DEV reset button)
-@app.post("/clear")
-def clear_all(
-    confirm: bool = Query(default=False, description="Must be true to clear everything."),
-    delete_vectors: bool = Query(default=True, description="Also delete vector DB files on disk."),
-) -> Dict[str, Any]:
-    """
-    Clears all documents + PDFs. Useful for online/dev when storage gets messy.
-
-    confirm=true is required so you don't wipe things accidentally.
-    """
-    if not confirm:
-        raise HTTPException(status_code=400, detail="Pass confirm=true to clear all data.")
-
-    # 1) Remove docs from vector store
-    docs = vector_store.list_documents()
-    removed_doc_ids: List[str] = []
-    for d in docs:
-        if vector_store.remove_document(d.document_id):
-            removed_doc_ids.append(d.document_id)
-
-    # 2) Delete all PDFs in upload dir
-    deleted_pdfs: List[str] = []
-    failed_pdfs: List[str] = []
-    try:
-        for name in os.listdir(UPLOAD_DIR):
-            if not name.lower().endswith(".pdf"):
-                continue
-            p = os.path.join(UPLOAD_DIR, name)
-            if _safe_remove_file(p):
-                deleted_pdfs.append(name)
-            else:
-                failed_pdfs.append(name)
-    except Exception as e:
-        failed_pdfs.append(f"UPLOAD_DIR_ERROR: {e}")
-
-    # 3) Optionally delete vector DB files on disk (hard reset)
-    deleted_vector_files: List[str] = []
-    if delete_vectors:
-        candidates = [
-            os.path.join(VECTOR_DB_DIR, "chunks.json"),
-            os.path.join(VECTOR_DB_DIR, "documents.json"),
-            os.path.join(VECTOR_DB_DIR, "embeddings.npy"),
-        ]
-        for fp in candidates:
-            if _safe_remove_file(fp):
-                deleted_vector_files.append(fp)
-
-        # Reload empty store after deleting files
-        vector_store.load()
-
-    return {
-        "ok": True,
-        "removed_doc_ids": removed_doc_ids,
-        "deleted_pdfs": deleted_pdfs,
-        "failed_pdfs": failed_pdfs,
-        "deleted_vector_files": deleted_vector_files,
     }

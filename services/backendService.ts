@@ -20,9 +20,10 @@ export type DocumentInfo = {
   pages: number;
 };
 
-const DEFAULT_BASE_URL = "https://nexusai-rag-assistant.onrender.com";
-
-// Vite env var (recommended). Put in .env.local as VITE_BACKEND_URL=...
+// IMPORTANT:
+// - Local dev: set VITE_BACKEND_URL=http://127.0.0.1:8000 in .env.local
+// - Production: set VITE_BACKEND_URL=https://<your-render-backend>.onrender.com
+const DEFAULT_BASE_URL = "http://127.0.0.1:8000";
 const BASE_URL = (import.meta as any).env?.VITE_BACKEND_URL || DEFAULT_BASE_URL;
 
 export class BackendService {
@@ -45,6 +46,33 @@ export class BackendService {
     return await res.json();
   }
 
+  async deleteDocument(documentId: string): Promise<{ ok: boolean }> {
+    const res = await fetch(
+      `${BASE_URL}/documents/${encodeURIComponent(documentId)}`,
+      { method: "DELETE" }
+    );
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(
+        `Failed DELETE /documents/${documentId}: ${res.status} ${text}`
+      );
+    }
+
+    return await res.json().catch(() => ({ ok: true }));
+  }
+
+  async clearAll(): Promise<{ ok: boolean }> {
+    const res = await fetch(`${BASE_URL}/clear`, { method: "POST" });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`Failed POST /clear: ${res.status} ${text}`);
+    }
+
+    return await res.json().catch(() => ({ ok: true }));
+  }
+
   async query(question: string, top_k = 5): Promise<QueryResponse> {
     const res = await fetch(`${BASE_URL}/query`, {
       method: "POST",
@@ -56,7 +84,11 @@ export class BackendService {
     return await res.json();
   }
 
-  async compare(question: string, doc_ids: string[], top_k_per_doc = 3): Promise<CompareResponse> {
+  async compare(
+    question: string,
+    doc_ids: string[],
+    top_k_per_doc = 3
+  ): Promise<CompareResponse> {
     const res = await fetch(`${BASE_URL}/compare`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -67,3 +99,6 @@ export class BackendService {
     return await res.json();
   }
 }
+
+export const backendService = new BackendService();
+export { BASE_URL };

@@ -1,5 +1,6 @@
-import React, { useRef, useEffect } from 'react';
-import { Message } from '../types';
+// components/ChatWindow.tsx
+import React, { useRef, useEffect } from "react";
+import { Message, SourceLike } from "../types";
 
 interface ChatWindowProps {
   messages: Message[];
@@ -10,32 +11,91 @@ interface ChatWindowProps {
   isLoading: boolean;
 }
 
-type SourceLike =
-  | string
-  | {
-      author?: string;
-      year?: string | number;
-      title?: string;
-      pages?: number[];
-      page?: number;
-      citation?: string;
-      [key: string]: any;
-    };
+function safeStringify(obj: any): string {
+  try {
+    return JSON.stringify(obj);
+  } catch {
+    return "[unserializable object]";
+  }
+}
 
-function formatSource(src: SourceLike): string {
-  // If backend returns a plain string, render it directly
-  if (typeof src === 'string') return src;
+function uniqNumbers(arr: number[]): number[] {
+  const s = new Set<number>();
+  for (const n of arr) {
+    if (typeof n === "number" && !Number.isNaN(n)) s.add(n);
+  }
+  return Array.from(s).sort((a, b) => a - b);
+}
 
-  // Preferred: backend already provides a formatted in-text citation string
-  if (src?.citation && typeof src.citation === 'string') return src.citation;
+function getPages(src: any): number[] {
+  if (!src || typeof src !== "object") return [];
+  const pages: number[] = [];
+  if (typeof src.page === "number") pages.push(src.page);
+  if (Array.isArray(src.pages)) {
+    for (const p of src.pages) {
+      if (typeof p === "number") pages.push(p);
+    }
+  }
+  return uniqNumbers(pages);
+}
 
-  // Fallback: build something readable
-  const author = src?.author ?? 'Unknown';
-  const year = src?.year ?? 'n.d.';
-  const page = src?.page ?? (Array.isArray(src?.pages) && src.pages.length ? src.pages[0] : undefined);
+function getTitle(src: any): string {
+  if (!src || typeof src !== "object") return "";
+  return (
+    src.title ||
+    src.document_title ||
+    src.filename ||
+    src.fileName ||
+    src.document_filename ||
+    ""
+  );
+}
 
-  if (page !== undefined) return `${author}, ${year}, p. ${page}`;
+function getAuthor(src: any): string {
+  if (!src || typeof src !== "object") return "";
+  return src.author || src.document_author || "";
+}
+
+function getYear(src: any): string {
+  if (!src || typeof src !== "object") return "";
+  const y = src.year ?? src.document_year ?? "";
+  return y === "" ? "" : String(y);
+}
+
+function formatSourceBadge(src: SourceLike): string {
+  if (typeof src === "string") return src;
+
+  // If backend gives a ready citation string, use it
+  if (src?.citation && typeof src.citation === "string") return src.citation;
+
+  const author = getAuthor(src) || "Unknown";
+  const year = getYear(src) || "n.d.";
+  const pages = getPages(src);
+
+  if (pages.length) return `${author}, ${year}, p. ${pages[0]}`;
   return `${author}, ${year}`;
+}
+
+function formatSourceDetails(src: SourceLike): {
+  title: string;
+  authorYear: string;
+  pagesLabel: string;
+} {
+  if (typeof src === "string") {
+    return { title: src, authorYear: "", pagesLabel: "" };
+  }
+
+  const title = getTitle(src) || "Source";
+  const author = getAuthor(src);
+  const year = getYear(src);
+  const pages = getPages(src);
+
+  const authorYear =
+    author || year ? `${author || "Unknown"}${year ? ` (${year})` : ""}` : "";
+
+  const pagesLabel = pages.length ? `Pages: ${pages.join(", ")}` : "";
+
+  return { title, authorYear, pagesLabel };
 }
 
 export const ChatWindow: React.FC<ChatWindowProps> = ({
@@ -55,7 +115,7 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
   }, [messages, isLoading]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       onSend();
     }
@@ -63,11 +123,19 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
 
   return (
     <div className="flex-1 flex flex-col h-full bg-[#f8fafc]">
-      <div ref={scrollRef} className="flex-1 overflow-y-auto p-8 space-y-8 custom-scrollbar">
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto p-8 space-y-8 custom-scrollbar"
+      >
         {messages.length === 0 && (
           <div className="h-full flex flex-col items-center justify-center text-center max-w-md mx-auto">
             <div className="w-16 h-16 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center mb-6">
-              <svg className="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <svg
+                className="w-8 h-8"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
                 <path
                   strokeLinecap="round"
                   strokeLinejoin="round"
@@ -76,29 +144,42 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                 ></path>
               </svg>
             </div>
-            <h2 className="text-xl font-bold text-slate-800 mb-2">Ready to analyze</h2>
+            <h2 className="text-xl font-bold text-slate-800 mb-2">
+              Ready to analyze
+            </h2>
             <p className="text-slate-500 text-sm">
-              Upload documents to build your APA-compliant knowledge base or ask a question.
+              Upload documents to build your APA-compliant knowledge base or ask
+              a question.
             </p>
           </div>
         )}
 
         {messages.map((msg) => (
-          <div key={msg.id} className={`flex group ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+          <div
+            key={msg.id}
+            className={`flex group ${
+              msg.role === "user" ? "justify-end" : "justify-start"
+            }`}
+          >
             <div
               className={`relative max-w-[85%] rounded-2xl p-5 shadow-sm transition-all ${
-                msg.role === 'user'
-                  ? 'bg-indigo-600 text-white rounded-tr-none'
-                  : 'bg-white border border-slate-200 text-slate-800 rounded-tl-none'
+                msg.role === "user"
+                  ? "bg-indigo-600 text-white rounded-tr-none"
+                  : "bg-white border border-slate-200 text-slate-800 rounded-tl-none"
               }`}
             >
-              {msg.role === 'user' && (
+              {msg.role === "user" && (
                 <button
                   onClick={() => onEditMessage(msg.id)}
                   className="absolute -left-10 top-2 p-2 opacity-0 group-hover:opacity-100 transition-opacity text-slate-400 hover:text-indigo-600"
                   title="Edit and Re-run"
                 >
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <svg
+                    className="w-4 h-4"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
                     <path
                       strokeLinecap="round"
                       strokeLinejoin="round"
@@ -109,23 +190,74 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
                 </button>
               )}
 
-              <div className="whitespace-pre-wrap text-sm leading-relaxed">{msg.content}</div>
+              <div className="whitespace-pre-wrap text-sm leading-relaxed">
+                {msg.content}
+              </div>
 
+              {/* ✅ OpenEvidence-style Sources panel */}
               {msg.sources && Array.isArray(msg.sources) && msg.sources.length > 0 && (
-                <div className="mt-4 pt-3 border-t border-slate-100 flex flex-wrap gap-2">
-                  <span className="text-[10px] font-bold text-slate-400 mr-1 self-center uppercase">
-                    APA Sources:
-                  </span>
-
-                  {msg.sources.map((src: any, i: number) => (
-                    <span
-                      key={i}
-                      className="text-[10px] bg-indigo-50 text-indigo-600 font-bold px-2 py-0.5 rounded-full border border-indigo-100"
-                      title={typeof src === 'string' ? src : JSON.stringify(src)}
-                    >
-                      {formatSource(src as SourceLike)}
+                <div className="mt-4 pt-3 border-t border-slate-100">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                      Sources
                     </span>
-                  ))}
+                    <span className="text-[10px] text-slate-400">
+                      {msg.sources.length}
+                    </span>
+                  </div>
+
+                  {/* Compact badges */}
+                  <div className="flex flex-wrap gap-2">
+                    {msg.sources.slice(0, 8).map((src: SourceLike, i: number) => (
+                      <span
+                        key={i}
+                        className="text-[10px] bg-indigo-50 text-indigo-700 font-bold px-2 py-0.5 rounded-full border border-indigo-100"
+                        title={typeof src === "string" ? src : safeStringify(src)}
+                      >
+                        {formatSourceBadge(src)}
+                      </span>
+                    ))}
+                    {msg.sources.length > 8 && (
+                      <span className="text-[10px] text-slate-400 self-center">
+                        +{msg.sources.length - 8} more
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Detailed list */}
+                  <div className="mt-3 space-y-2">
+                    {msg.sources.slice(0, 5).map((src: SourceLike, i: number) => {
+                      const d = formatSourceDetails(src);
+                      return (
+                        <div
+                          key={`detail_${i}`}
+                          className="bg-slate-50 border border-slate-200 rounded-xl p-3"
+                        >
+                          <div className="text-xs font-bold text-slate-700 truncate">
+                            {d.title}
+                          </div>
+                          {d.authorYear && (
+                            <div className="text-[11px] text-slate-500 mt-0.5">
+                              {d.authorYear}
+                            </div>
+                          )}
+                          {d.pagesLabel && (
+                            <div className="text-[11px] text-slate-500 mt-0.5">
+                              {d.pagesLabel}
+                            </div>
+                          )}
+
+                          {/* Optional snippet if backend included it */}
+                          {typeof src !== "string" && src?.text && (
+                            <div className="text-[11px] text-slate-600 mt-2 line-clamp-3 whitespace-pre-wrap">
+                              {String(src.text).slice(0, 280)}
+                              {String(src.text).length > 280 ? "..." : ""}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
               )}
             </div>
@@ -157,19 +289,29 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({
             onKeyDown={handleKeyDown}
             placeholder="Ask your corpus a question..."
             className="w-full bg-transparent border-none focus:ring-0 p-4 pr-16 text-sm resize-none custom-scrollbar"
-            style={{ maxHeight: '200px' }}
+            style={{ maxHeight: "200px" }}
           />
           <button
             onClick={onSend}
             disabled={!input.trim() || isLoading}
             className={`absolute right-4 bottom-4 w-10 h-10 rounded-xl flex items-center justify-center transition-all ${
               !input.trim() || isLoading
-                ? 'bg-slate-100 text-slate-400'
-                : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-lg'
+                ? "bg-slate-100 text-slate-400"
+                : "bg-indigo-600 text-white hover:bg-indigo-700 shadow-lg"
             }`}
           >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"></path>
+            <svg
+              className="w-5 h-5"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth="2"
+                d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"
+              ></path>
             </svg>
           </button>
         </div>

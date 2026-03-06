@@ -41,15 +41,14 @@ def _looks_like_low_signal_text(text: str) -> bool:
     alnum = sum(ch.isalnum() for ch in t)
     ratio = alnum / max(1, len(t))
 
-    # If mostly non-alphanumeric (bullets, symbols, lines) -> low signal
+    # If mostly non-alphanumeric -> low signal
     if ratio < 0.35:
         return True
 
-    # If it looks like just course/page markers (common in slide decks)
+    # If it looks like just course/page markers
     footer_signals = ["420-", "page", "chapter", "presented by"]
     footer_hits = sum(1 for s in footer_signals if s in t.lower())
 
-    # If short and dominated by footer signals -> low signal
     if len(t) < 120 and footer_hits >= 1:
         return True
 
@@ -64,14 +63,12 @@ def _try_ocr_page(page: "fitz.Page", dpi: int = 250) -> str:
         import pytesseract
         from PIL import Image
 
-        # Apply explicit tesseract path (important on Windows)
         if TESSERACT_CMD:
             pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
         pix = page.get_pixmap(dpi=dpi)
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-        # You can tweak config; this is a decent default
         config = "--oem 3 --psm 6"
         text = pytesseract.image_to_string(img, config=config)
 
@@ -80,9 +77,64 @@ def _try_ocr_page(page: "fitz.Page", dpi: int = 250) -> str:
         return ""
 
 
+def _read_first_page_text(file_path: str, max_chars: int = 3000) -> str:
+    """
+    Reads first page text only. Safe and fast.
+    """
+    try:
+        doc = fitz.open(file_path)
+        if doc.page_count < 1:
+            doc.close()
+            return ""
+        page = doc.load_page(0)
+        text = (page.get_text("text") or "").strip()
+        doc.close()
+        if not text:
+            return ""
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:max_chars]
+    except Exception:
+        return ""
+
+
+def _extract_presenter_or_author(text: str) -> str:
+    """
+    Tries to extract presenter/author from common cover-page patterns.
+    """
+    if not text:
+        return ""
+
+    # Presented by: Name
+    m = re.search(r"Presented\s*by\s*:\s*([^\n\r]+)", text, flags=re.IGNORECASE)
+    if m:
+        name = m.group(1).strip()
+        name = name.split("|")[0].strip()
+        return re.sub(r"\s{2,}", " ", name).strip()
+
+    # Author: Name
+    m = re.search(r"Author\s*:\s*([^\n\r]+)", text, flags=re.IGNORECASE)
+    if m:
+        return re.sub(r"\s{2,}", " ", m.group(1).strip())
+
+    # By Name (common papers)
+    m = re.search(r"\bBy\s+([A-Z][A-Za-z\-\s]{2,80})", text)
+    if m:
+        return re.sub(r"\s{2,}", " ", m.group(1).strip())
+
+    return ""
+
+
+def _extract_year_from_text(text: str) -> str:
+    if not text:
+        return ""
+    m = re.search(r"(19|20)\d{2}", text)
+    return m.group(0) if m else ""
+
+
 def extract_metadata(file_path: str) -> Dict[str, str]:
     """
     Safe metadata extraction. Never crashes ingestion.
+    Also tries to improve author/year using first-page text as fallback.
     """
     meta = {"title": "", "author": "", "year": ""}
 
@@ -93,7 +145,6 @@ def extract_metadata(file_path: str) -> Dict[str, str]:
         meta["title"] = (md.get("title") or "").strip()
         meta["author"] = (md.get("author") or "").strip()
 
-        # Embedded year from metadata date fields
         embedded_year = ""
         for k in ["creationDate", "modDate"]:
             v = (md.get(k) or "").strip()
@@ -106,6 +157,25 @@ def extract_metadata(file_path: str) -> Dict[str, str]:
         doc.close()
     except Exception:
         pass
+
+    # --- Fallback enhancement from first page text ---
+    # (Do not overwrite good metadata; only fill missing fields)
+    first_text = _read_first_page_text(file_path)
+    if first_text:
+        if not meta["author"]:
+            author = _extract_presenter_or_author(first_text)
+            if author:
+                meta["author"] = author
+
+        if not meta["year"]:
+            year = _extract_year_from_text(first_text)
+            if year:
+                meta["year"] = year
+
+        # If metadata title is missing or generic, at least set something stable
+        if not meta["title"]:
+            # Use filename as safe fallback; title refinement happens in main.py override
+            meta["title"] = os.path.basename(file_path)
 
     return meta
 
@@ -145,11 +215,9 @@ def read_pdf_chunks(
 
         if should_ocr:
             ocr_text = _try_ocr_page(page, dpi=ocr_dpi)
-            # If OCR gave something meaningful, prefer it
             if ocr_text and len(ocr_text) > len(text):
                 text = ocr_text
             elif ocr_text and len(text) < 80:
-                # even if not longer, replace tiny junk text
                 text = ocr_text
 
         if not text:

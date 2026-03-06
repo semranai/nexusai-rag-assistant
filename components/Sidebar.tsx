@@ -1,4 +1,4 @@
-// components/Sidebar.tsx - UPDATED: doc selection + summarize button
+// components/Sidebar.tsx
 import React, { ChangeEvent } from "react";
 import { AssistantConfig, AnalysisMode } from "../types";
 
@@ -19,7 +19,7 @@ interface Document {
   author: string;
   year: string;
   chunk_count: number;
-  upload_time: number; // ms timestamp
+  upload_time: number;
   status: string;
 }
 
@@ -32,11 +32,7 @@ interface SidebarProps {
   backendStatus: "online" | "offline" | "checking";
   onDeleteDocument: (docId: string) => void;
   onRefreshDocuments: () => void;
-
-  // ✅ new
-  selectedDocId: string | null;
-  onSelectDocument: (docId: string | null) => void;
-  onSummarizeSelected: () => void;
+  onClearAll: () => void;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -48,16 +44,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
   backendStatus,
   onDeleteDocument,
   onRefreshDocuments,
-  selectedDocId,
-  onSelectDocument,
-  onSummarizeSelected,
+  onClearAll,
 }) => {
-  const activeJobs = processingJobs.filter((j) => j.status === "processing");
-  const completedJobs = processingJobs.filter((j) => j.status === "completed");
+  const confirmDeleteOne = (doc: Document) => {
+    const name = doc.title || doc.filename || doc.id;
+    const ok = window.confirm(`Delete this document?\n\n${name}`);
+    if (ok) onDeleteDocument(doc.id);
+  };
 
-  const selectedDoc = selectedDocId
-    ? documents.find((d) => d.id === selectedDocId)
-    : null;
+  const confirmClearAll = () => {
+    const ok = window.confirm(
+      `Clear ALL documents?\n\nThis will delete all documents + PDFs from the system.`
+    );
+    if (ok) onClearAll();
+  };
 
   return (
     <aside className="w-80 bg-white border-r border-gray-200 flex flex-col h-full">
@@ -96,46 +96,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
             {documents.length} docs • {processingJobs.length} jobs
           </span>
         </div>
-
-        {/* ✅ Selected doc banner */}
-        <div className="mt-3 p-2 rounded border bg-gray-50">
-          <div className="text-xs font-semibold text-gray-700">
-            Selected doc:
-          </div>
-          <div className="text-xs text-gray-600 truncate">
-            {selectedDoc
-              ? selectedDoc.title || selectedDoc.filename
-              : "None (asking whole corpus)"}
-          </div>
-
-          <div className="mt-2 flex gap-2">
-            <button
-              onClick={onSummarizeSelected}
-              disabled={!selectedDocId || backendStatus !== "online"}
-              className={`flex-1 text-xs py-2 rounded border font-medium ${
-                !selectedDocId || backendStatus !== "online"
-                  ? "bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed"
-                  : "bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100"
-              }`}
-              title="Summarize the selected document"
-            >
-              🧾 Summarize Selected
-            </button>
-
-            <button
-              onClick={() => onSelectDocument(null)}
-              disabled={!selectedDocId}
-              className={`text-xs py-2 px-2 rounded border ${
-                !selectedDocId
-                  ? "bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed"
-                  : "bg-white text-gray-700 border-gray-200 hover:bg-gray-50"
-              }`}
-              title="Clear selection (ask across all docs)"
-            >
-              ✕
-            </button>
-          </div>
-        </div>
       </div>
 
       {/* Upload Section */}
@@ -154,7 +114,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
             id="file-upload"
             disabled={backendStatus !== "online"}
           />
-
           <label
             htmlFor="file-upload"
             className={`block w-full text-center py-2 px-3 rounded border cursor-pointer text-sm font-medium transition-colors ${
@@ -237,7 +196,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
       <div className="p-4 border-b flex-1 overflow-y-auto">
         <div className="flex justify-between items-center mb-3">
           <h3 className="text-sm font-medium text-gray-700">📚 Documents</h3>
-          <div className="flex gap-2">
+
+          <div className="flex gap-2 items-center">
             <button
               onClick={onRefreshDocuments}
               className="text-xs text-blue-600 hover:text-blue-800"
@@ -245,76 +205,70 @@ export const Sidebar: React.FC<SidebarProps> = ({
             >
               ↻
             </button>
-            <span className="text-xs text-gray-500">
-              {documents.length} loaded
-            </span>
+
+            <button
+              onClick={confirmClearAll}
+              disabled={documents.length === 0 || backendStatus !== "online"}
+              className={`text-xs px-2 py-1 rounded border ${
+                documents.length === 0 || backendStatus !== "online"
+                  ? "bg-gray-100 text-gray-400 border-gray-200"
+                  : "bg-red-50 text-red-700 border-red-200 hover:bg-red-100"
+              }`}
+              title="Delete all documents"
+            >
+              Clear All
+            </button>
           </div>
         </div>
 
         <div className="space-y-3">
-          {documents.map((doc) => {
-            const isSelected = selectedDocId === doc.id;
-
-            return (
-              <div
-                key={doc.id}
-                onClick={() => onSelectDocument(doc.id)}
-                className={`p-3 rounded border transition-colors cursor-pointer ${
-                  isSelected
-                    ? "bg-indigo-50 border-indigo-300"
-                    : "bg-gray-50 border-gray-200 hover:bg-gray-100"
-                }`}
-                title="Click to select this document"
-              >
-                <div className="flex justify-between items-start">
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-medium text-gray-800 truncate">
-                      {doc.title || doc.filename}
-                    </div>
-                    <div className="text-xs text-gray-500 mt-1">
-                      {doc.author && <span>{doc.author} • </span>}
-                      {doc.chunk_count} chunks
-                    </div>
-                    {doc.year && (
-                      <div className="text-xs text-gray-400 mt-1">
-                        {doc.year}
-                      </div>
-                    )}
+          {documents.map((doc) => (
+            <div
+              key={doc.id}
+              className="bg-gray-50 p-3 rounded border border-gray-200 hover:bg-gray-100 transition-colors"
+            >
+              <div className="flex justify-between items-start">
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm font-medium text-gray-800 truncate">
+                    {doc.title || doc.filename}
                   </div>
-
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onDeleteDocument(doc.id);
-                    }}
-                    className="text-xs text-red-500 hover:text-red-700 ml-2 p-1"
-                    title="Delete document"
-                  >
-                    ×
-                  </button>
+                  <div className="text-xs text-gray-500 mt-1">
+                    {doc.author && <span>{doc.author} • </span>}
+                    {doc.chunk_count} chunks
+                  </div>
+                  {doc.year && (
+                    <div className="text-xs text-gray-400 mt-1">{doc.year}</div>
+                  )}
                 </div>
 
-                <div className="flex items-center justify-between mt-2">
-                  <span
-                    className={`text-xs px-2 py-0.5 rounded ${
-                      doc.status === "ready"
-                        ? "bg-green-100 text-green-700"
-                        : doc.status === "processing"
-                        ? "bg-blue-100 text-blue-700"
-                        : "bg-gray-100 text-gray-700"
-                    }`}
-                  >
-                    {doc.status}
-                  </span>
-
-                  {/* ✅ upload_time is ms already */}
-                  <span className="text-xs text-gray-500">
-                    {new Date(doc.upload_time).toLocaleDateString()}
-                  </span>
-                </div>
+                <button
+                  onClick={() => confirmDeleteOne(doc)}
+                  className="text-xs text-red-500 hover:text-red-700 ml-2 p-1"
+                  title="Delete document"
+                >
+                  ×
+                </button>
               </div>
-            );
-          })}
+
+              <div className="flex items-center justify-between mt-2">
+                <span
+                  className={`text-xs px-2 py-0.5 rounded ${
+                    doc.status === "loaded"
+                      ? "bg-green-100 text-green-700"
+                      : doc.status === "processing"
+                      ? "bg-blue-100 text-blue-700"
+                      : "bg-gray-100 text-gray-700"
+                  }`}
+                >
+                  {doc.status}
+                </span>
+
+                <span className="text-xs text-gray-500">
+                  {new Date(doc.upload_time).toLocaleDateString()}
+                </span>
+              </div>
+            </div>
+          ))}
 
           {documents.length === 0 && (
             <div className="text-center py-8 text-gray-400">
@@ -340,7 +294,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <p className="text-xs text-gray-500">Show page references</p>
             </div>
             <button
-              onClick={() => setConfig({ ...config, citeSources: !config.citeSources })}
+              onClick={() =>
+                setConfig({ ...config, citeSources: !config.citeSources })
+              }
               className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
                 config.citeSources ? "bg-blue-500" : "bg-gray-300"
               }`}
@@ -353,7 +309,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </button>
           </div>
 
-          {/* Analysis Mode (kept, but now Summarize is mainly via button) */}
+          {/* Analysis Mode */}
           <div>
             <label className="block text-sm text-gray-600 mb-2">
               Analysis Mode
@@ -380,10 +336,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 Analyze
               </button>
             </div>
-
-            <p className="text-[11px] text-gray-500 mt-2">
-              Tip: Select a doc → Ask queries are doc-scoped automatically. Use “Summarize Selected” for summaries.
-            </p>
           </div>
 
           {/* Temperature */}
@@ -415,7 +367,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </div>
         </div>
 
-        {/* Footer */}
         <div className="mt-6 pt-4 border-t border-gray-200">
           <div className="text-xs text-gray-500">
             <div className="font-medium">NexusAI v5.0</div>

@@ -1,12 +1,9 @@
-// App.tsx - UPDATED: doc selection + summarize_doc + query_doc support
+// App.tsx
 import React, { useState, useEffect, ChangeEvent } from "react";
 import { Sidebar } from "./components/Sidebar";
 import { ChatWindow } from "./components/ChatWindow";
 import { Message, AssistantConfig, AnalysisMode } from "./types";
-
-// ✅ Use env var if available, fallback to localhost
-const BACKEND_URL =
-  (import.meta as any).env?.VITE_BACKEND_URL || "http://127.0.0.1:8000";
+import { backendService } from "./services/backendService";
 
 interface ProcessingJob {
   id: string;
@@ -18,16 +15,6 @@ interface ProcessingJob {
   document_id?: string;
 }
 
-interface BackendDocument {
-  document_id: string;
-  filename: string;
-  title: string;
-  author: string;
-  year: string;
-  num_chunks: number;
-  pages: number;
-}
-
 interface Document {
   id: string;
   filename: string;
@@ -35,17 +22,15 @@ interface Document {
   author: string;
   year: string;
   chunk_count: number;
-  upload_time: number; // ms timestamp
+  upload_time: number;
   status: string;
 }
 
 type QueryResponse = {
-  question?: string;
-  answer?: string;
-  summary?: string; // for summarize_doc
+  question: string;
+  answer: string;
   citations?: any[];
   evidence?: any[];
-  used_doc_id?: string;
 };
 
 const App: React.FC = () => {
@@ -68,9 +53,6 @@ const App: React.FC = () => {
     "online" | "offline" | "checking"
   >("checking");
 
-  // ✅ new: selected document id
-  const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
-
   const [config, setConfig] = useState<AssistantConfig>({
     temperature: 0.7,
     citeSources: true,
@@ -78,17 +60,13 @@ const App: React.FC = () => {
     systemPrompt: "You are an expert analyst examining multiple documents.",
   });
 
-  // -----------------------------
-  // Helpers
-  // -----------------------------
-  const addAssistant = (content: string, sources?: any[]) => {
+  const addAssistant = (content: string) => {
     setMessages((prev) => [
       ...prev,
       {
         id: Date.now().toString(),
         role: "assistant",
         content,
-        sources: sources || [],
         timestamp: Date.now(),
       },
     ]);
@@ -96,8 +74,8 @@ const App: React.FC = () => {
 
   const checkBackendStatus = async (): Promise<void> => {
     try {
-      const res = await fetch(`${BACKEND_URL}/system`);
-      setBackendStatus(res.ok ? "online" : "offline");
+      await backendService.listDocuments();
+      setBackendStatus("online");
     } catch {
       setBackendStatus("offline");
     }
@@ -105,11 +83,7 @@ const App: React.FC = () => {
 
   const fetchDocuments = async (): Promise<void> => {
     try {
-      const res = await fetch(`${BACKEND_URL}/documents`);
-      if (!res.ok) return;
-
-      const raw: BackendDocument[] = await res.json();
-
+      const raw = await backendService.listDocuments();
       const mapped: Document[] = (raw || []).map((d) => ({
         id: d.document_id,
         filename: d.filename,
@@ -117,16 +91,10 @@ const App: React.FC = () => {
         author: d.author,
         year: d.year,
         chunk_count: d.num_chunks,
-        upload_time: Date.now(), // ms
+        upload_time: Date.now(),
         status: "ready",
       }));
-
       setDocuments(mapped);
-
-      // ✅ if selected doc disappeared, clear selection
-      if (selectedDocId && !mapped.some((m) => m.id === selectedDocId)) {
-        setSelectedDocId(null);
-      }
     } catch (err) {
       console.error("Error fetching documents:", err);
     }
@@ -142,7 +110,6 @@ const App: React.FC = () => {
     }, 10000);
 
     return () => clearInterval(interval);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // -----------------------------
@@ -176,19 +143,8 @@ const App: React.FC = () => {
         },
       ]);
 
-      const formData = new FormData();
-      formData.append("file", file);
-
       try {
-        // ✅ be explicit: replace if same filename
-        const res = await fetch(`${BACKEND_URL}/upload?force=true`, {
-          method: "POST",
-          body: formData,
-        });
-
-        if (!res.ok) throw new Error(`Upload failed: ${res.statusText}`);
-
-        const data = await res.json(); // { ok: true, saved_as: "file.pdf" }
+        const data = await backendService.uploadPdf(file);
 
         setProcessingJobs((prev) =>
           prev.map((j) =>
@@ -204,7 +160,6 @@ const App: React.FC = () => {
         );
 
         addAssistant(`✅ **Uploaded & indexed**: ${data.saved_as || file.name}`);
-
         await fetchDocuments();
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Unknown error";
@@ -223,60 +178,7 @@ const App: React.FC = () => {
   };
 
   // -----------------------------
-  // Summarize selected doc
-  // -----------------------------
-  const handleSummarizeSelected = async (): Promise<void> => {
-    if (!selectedDocId || isLoading) {
-      addAssistant("⚠️ Select a document first to summarize.");
-      return;
-    }
-
-    setIsLoading(true);
-
-    const doc = documents.find((d) => d.id === selectedDocId);
-    const docLabel = doc?.title || doc?.filename || selectedDocId;
-
-    addAssistant(`🧾 Summarizing **${docLabel}**…`);
-
-    try {
-      const res = await fetch(`${BACKEND_URL}/summarize_doc`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          document_id: selectedDocId,
-          max_chars: 1200,
-        }),
-      });
-
-      if (!res.ok) throw new Error(`Backend error: ${res.statusText}`);
-
-      const data: QueryResponse = await res.json();
-
-      const summaryText = data.summary || "No summary returned.";
-
-      let extra = "";
-      if (config.citeSources && data.citations?.length) {
-        const citeLines = data.citations
-          .slice(0, 6)
-          .map(
-            (c: any) =>
-              `• ${c.citation || `${c.author || "Unknown"}, ${c.year || "n.d."}`}`
-          )
-          .join("\n");
-        extra += `\n\n**Citations:**\n${citeLines}`;
-      }
-
-      addAssistant(`**Summary — ${docLabel}**\n\n${summaryText}${extra}`, data.citations || []);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "Connection failed";
-      addAssistant(`❌ Summarize error: ${msg}`);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  // -----------------------------
-  // Ask (Query / Query_doc)
+  // Ask (Query)
   // -----------------------------
   const handleSend = async (): Promise<void> => {
     if (!input.trim() || isLoading) return;
@@ -295,22 +197,7 @@ const App: React.FC = () => {
     setIsLoading(true);
 
     try {
-      // ✅ if a doc is selected, query ONLY that doc
-      const endpoint = selectedDocId ? "/query_doc" : "/query";
-
-      const body = selectedDocId
-        ? { question, document_id: selectedDocId, top_k: 8 }
-        : { question, top_k: 8 };
-
-      const res = await fetch(`${BACKEND_URL}${endpoint}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-
-      if (!res.ok) throw new Error(`Backend error: ${res.statusText}`);
-
-      const data: QueryResponse = await res.json();
+      const data: QueryResponse = await backendService.query(question, 5);
 
       let extra = "";
       if (config.citeSources && data.citations?.length) {
@@ -318,7 +205,9 @@ const App: React.FC = () => {
           .slice(0, 6)
           .map(
             (c: any) =>
-              `• ${c.citation || `${c.author || "Unknown"}, ${c.year || "n.d."}`}`
+              `• ${
+                c.citation || `${c.author || "Unknown"}, ${c.year || "n.d."}`
+              }`
           )
           .join("\n");
         extra += `\n\n**Citations:**\n${citeLines}`;
@@ -342,10 +231,32 @@ const App: React.FC = () => {
   };
 
   // -----------------------------
-  // Delete doc (not supported)
+  // Delete doc (×)
   // -----------------------------
-  const deleteDocument = async (_docId: string): Promise<void> => {
-    addAssistant("⚠️ Delete is not implemented on the backend yet.");
+  const deleteDocument = async (docId: string): Promise<void> => {
+    if (!docId) return;
+    try {
+      await backendService.deleteDocument(docId);
+      addAssistant(`🗑️ Deleted document: ${docId}`);
+      await fetchDocuments();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Delete failed";
+      addAssistant(`❌ Delete error: ${msg}`);
+    }
+  };
+
+  // -----------------------------
+  // Clear all
+  // -----------------------------
+  const clearAllDocuments = async (): Promise<void> => {
+    try {
+      await backendService.clearAll();
+      addAssistant(`🧹 Cleared all documents.`);
+      await fetchDocuments();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Clear failed";
+      addAssistant(`❌ Clear error: ${msg}`);
+    }
   };
 
   const handleEditMessage = (id: string): void => {
@@ -368,10 +279,7 @@ const App: React.FC = () => {
         backendStatus={backendStatus}
         onDeleteDocument={deleteDocument}
         onRefreshDocuments={fetchDocuments}
-        // ✅ new props
-        selectedDocId={selectedDocId}
-        onSelectDocument={setSelectedDocId}
-        onSummarizeSelected={handleSummarizeSelected}
+        onClearAll={clearAllDocuments}
       />
 
       <main className="flex-1 overflow-hidden relative">
