@@ -31,6 +31,16 @@ type QueryResponse = {
   answer: string;
   citations?: any[];
   evidence?: any[];
+  status?: string;
+};
+
+type CompareResponse = {
+  question: string;
+  answer: string;
+  citations?: any[];
+  evidence?: any[];
+  used_doc_ids?: string[];
+  status?: string;
 };
 
 const App: React.FC = () => {
@@ -112,6 +122,38 @@ const App: React.FC = () => {
     return () => clearInterval(interval);
   }, []);
 
+  const shouldUseCompareMode = (question: string, docsCount: number): boolean => {
+    if (docsCount < 2) return false;
+
+    const q = question.toLowerCase().trim();
+
+    const multiDocSignals = [
+      "compare",
+      "all pdf",
+      "all the pdf",
+      "all uploaded",
+      "each pdf",
+      "each document",
+      "every pdf",
+      "every document",
+      "both pdf",
+      "both documents",
+      "three pdf",
+      "3 pdf",
+      "all documents",
+      "these pdfs",
+      "those pdfs",
+      "uploaded pdfs",
+      "uploaded documents",
+      "what each pdf",
+      "what does each pdf",
+      "summarize each pdf",
+      "one line with the title",
+    ];
+
+    return multiDocSignals.some((signal) => q.includes(signal));
+  };
+
   // -----------------------------
   // Upload
   // -----------------------------
@@ -178,12 +220,12 @@ const App: React.FC = () => {
   };
 
   // -----------------------------
-  // Ask (Query)
+  // Ask
   // -----------------------------
   const handleSend = async (): Promise<void> => {
     if (!input.trim() || isLoading) return;
 
-    const question = input;
+    const question = input.trim();
 
     const userMsg: Message = {
       id: Date.now().toString(),
@@ -197,20 +239,41 @@ const App: React.FC = () => {
     setIsLoading(true);
 
     try {
-      const data: QueryResponse = await backendService.query(question, 5);
+      const useCompare = shouldUseCompareMode(question, documents.length);
+
+      let data: QueryResponse | CompareResponse;
+
+      if (useCompare) {
+        const docIds = documents.map((d) => d.id);
+        data = await backendService.compare(question, docIds, 3);
+      } else {
+        data = await backendService.query(question, 5);
+      }
 
       let extra = "";
+
       if (config.citeSources && data.citations?.length) {
         const citeLines = data.citations
-          .slice(0, 6)
-          .map(
-            (c: any) =>
-              `• ${
-                c.citation || `${c.author || "Unknown"}, ${c.year || "n.d."}`
-              }`
-          )
+          .slice(0, 8)
+          .map((c: any) => {
+            const label =
+              c.citation ||
+              `${c.author || "Unknown"}, ${c.year || "n.d."}${
+                c.filename ? ` — ${c.filename}` : ""
+              }`;
+            return `• ${label}`;
+          })
           .join("\n");
+
         extra += `\n\n**Citations:**\n${citeLines}`;
+      }
+
+      if ((data as CompareResponse).used_doc_ids?.length) {
+        extra += `\n\n**Documents used:** ${(data as CompareResponse).used_doc_ids!.length}`;
+      }
+
+      if ((data as any).status && (data as any).status !== "answered") {
+        extra += `\n\n**Status:** ${(data as any).status}`;
       }
 
       const assistantMsg: Message = {

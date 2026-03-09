@@ -16,6 +16,8 @@ from answer_generator import (
     generate_answer,
     generate_comparison_answer,
     INSUFFICIENT_MSG,
+    NOT_MENTIONED_MSG,
+    SCANNED_OR_LOW_TEXT_MSG,
 )
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -178,7 +180,6 @@ def _make_metadata_chunk_text(meta: Dict[str, str], filename: str) -> str:
     title = (meta.get("title") or "").strip() or filename
     author = (meta.get("author") or "").strip() or "Unknown Author"
     year = (meta.get("year") or "").strip() or "n.d."
-    # Keep this “document facts” chunk short + searchable
     return (
         "DOCUMENT METADATA\n"
         f"Title: {title}\n"
@@ -218,7 +219,6 @@ def _ingest_one_pdf(pdf_path: str, force_reingest: bool = False) -> None:
         texts: List[str] = []
         stored_chunks: List[StoredChunk] = []
 
-        # ✅ Add synthetic metadata chunk so author/title/year questions always have evidence
         meta_text = _make_metadata_chunk_text(meta, filename)
         texts.append(meta_text)
         stored_chunks.append(
@@ -245,7 +245,6 @@ def _ingest_one_pdf(pdf_path: str, force_reingest: bool = False) -> None:
             )
         )
 
-        # Normal page chunks
         for c in chunks_raw:
             text = c.get("text", "") or ""
             md = c.get("metadata") or {}
@@ -550,6 +549,7 @@ def query_docs(req: QueryRequest) -> Dict[str, Any]:
         "answer": result.get("answer", INSUFFICIENT_MSG),
         "citations": result.get("citations", []),
         "evidence": result.get("evidence", []),
+        "status": result.get("status", "unknown"),
     }
 
 
@@ -565,6 +565,7 @@ def query_one_doc(req: QueryDocRequest) -> Dict[str, Any]:
             "evidence": [],
             "used_doc_id": req.document_id,
             "error": "document_id not found",
+            "status": "doc_not_found",
         }
 
     chunks = _vector_search_in_doc(req.question, req.document_id, top_k=max(1, int(req.top_k)))
@@ -575,6 +576,7 @@ def query_one_doc(req: QueryDocRequest) -> Dict[str, Any]:
         "citations": result.get("citations", []),
         "evidence": result.get("evidence", []),
         "used_doc_id": req.document_id,
+        "status": result.get("status", "unknown"),
     }
 
 
@@ -591,6 +593,7 @@ def query_multiple_docs(req: QueryDocsRequest) -> Dict[str, Any]:
             "citations": [],
             "evidence": [],
             "used_doc_ids": doc_ids,
+            "status": "doc_not_found",
         }
 
     chunks = _vector_search_compare(req.question, doc_ids, top_k_per_doc=max(1, int(req.top_k_per_doc)))
@@ -601,6 +604,7 @@ def query_multiple_docs(req: QueryDocsRequest) -> Dict[str, Any]:
         "citations": result.get("citations", []),
         "evidence": result.get("evidence", []),
         "used_doc_ids": doc_ids,
+        "status": result.get("status", "unknown"),
     }
 
 
@@ -619,6 +623,7 @@ def compare_docs(req: CompareRequest) -> Dict[str, Any]:
             "citations": [],
             "evidence": [],
             "used_doc_ids": doc_ids,
+            "status": "insufficient_documents",
         }
 
     chunks = _vector_search_compare(req.question, doc_ids, top_k_per_doc=max(1, int(req.top_k_per_doc)))
@@ -630,6 +635,7 @@ def compare_docs(req: CompareRequest) -> Dict[str, Any]:
         "citations": result.get("citations", []),
         "evidence": result.get("evidence", []),
         "used_doc_ids": doc_ids,
+        "status": result.get("status", "unknown"),
     }
 
 
@@ -643,6 +649,7 @@ def summarize_one_doc(req: SummarizeDocRequest) -> Dict[str, Any]:
             "evidence": [],
             "used_doc_id": req.document_id,
             "error": "document_id not found",
+            "status": "doc_not_found",
         }
 
     summary_prompt = (
@@ -673,4 +680,5 @@ def summarize_one_doc(req: SummarizeDocRequest) -> Dict[str, Any]:
         "summary": summary,
         "citations": result.get("citations", []),
         "evidence": result.get("evidence", []),
+        "status": result.get("status", "unknown"),
     }
