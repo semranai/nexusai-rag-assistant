@@ -2,9 +2,9 @@ import React, { useState, useEffect, ChangeEvent } from "react";
 import { Sidebar } from "./components/Sidebar";
 import { ChatWindow } from "./components/ChatWindow";
 import { Message, AssistantConfig, AnalysisMode } from "./types";
+import { backendService } from "./services/backendService";
 
-const BACKEND_URL =
-  import.meta.env.VITE_API_BASE_URL ?? "https://nexusai-rag-assistant.onrender.com";
+const BACKEND_URL = "https://nexusai-rag-assistant.onrender.com";
 
 interface ProcessingJob {
   id: string;
@@ -42,7 +42,7 @@ const App: React.FC = () => {
       id: "1",
       role: "assistant",
       content:
-  `🚀 **NexusAI Multi-Document RAG Ready**\n\nBackend URL: ${BASE_URL}\n\n• Upload multiple PDFs\n• Ask questions about one or more documents\n• Delete or clear documents anytime`,
+  `🚀 **NexusAI Multi-Document RAG Ready**\n\nBackend URL: ${BACKEND_URL}\n\n• Upload multiple PDFs\n• Ask questions about one or more documents\n• Delete or clear documents anytime`,
         timestamp: Date.now(),
     },
   ]);
