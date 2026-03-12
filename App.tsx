@@ -1,9 +1,10 @@
-// App.tsx
 import React, { useState, useEffect, ChangeEvent } from "react";
 import { Sidebar } from "./components/Sidebar";
 import { ChatWindow } from "./components/ChatWindow";
 import { Message, AssistantConfig, AnalysisMode } from "./types";
-import { backendService } from "./services/backendService";
+
+const BACKEND_URL =
+  import.meta.env.VITE_API_BASE_URL ?? "https://nexusai-rag-assistant.onrender.com";
 
 interface ProcessingJob {
   id: string;
