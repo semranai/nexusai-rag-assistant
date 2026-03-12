@@ -1,13 +1,11 @@
 // services/backendService.ts
 export type QueryResponse = {
-  question: string;
+  question?: string;
   answer: string;
   citations: any[];
   evidence: any[];
-};
-
-export type CompareResponse = QueryResponse & {
   used_doc_ids?: string[];
+  status?: string;
 };
 
 export type DocumentInfo = {
@@ -20,9 +18,6 @@ export type DocumentInfo = {
   pages: number;
 };
 
-// IMPORTANT:
-// - Local dev: set VITE_BACKEND_URL=http://127.0.0.1:8000 in .env.local
-// - Production: set VITE_BACKEND_URL=https://<your-render-backend>.onrender.com
 const DEFAULT_BASE_URL = "http://127.0.0.1:8000";
 const BASE_URL = (import.meta as any).env?.VITE_BACKEND_URL || DEFAULT_BASE_URL;
 
@@ -73,29 +68,18 @@ export class BackendService {
     return await res.json().catch(() => ({ ok: true }));
   }
 
-  async query(question: string, top_k = 5): Promise<QueryResponse> {
+  async query(question: string, top_k = 8): Promise<QueryResponse> {
     const res = await fetch(`${BASE_URL}/query`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ question, top_k }),
     });
 
-    if (!res.ok) throw new Error(`Failed /query: ${res.status}`);
-    return await res.json();
-  }
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`Failed /query: ${res.status} ${text}`);
+    }
 
-  async compare(
-    question: string,
-    doc_ids: string[],
-    top_k_per_doc = 3
-  ): Promise<CompareResponse> {
-    const res = await fetch(`${BASE_URL}/compare`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, doc_ids, top_k_per_doc }),
-    });
-
-    if (!res.ok) throw new Error(`Failed /compare: ${res.status}`);
     return await res.json();
   }
 }

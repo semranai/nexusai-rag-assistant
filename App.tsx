@@ -2,9 +2,7 @@ import React, { useState, useEffect, ChangeEvent } from "react";
 import { Sidebar } from "./components/Sidebar";
 import { ChatWindow } from "./components/ChatWindow";
 import { Message, AssistantConfig, AnalysisMode } from "./types";
-
-const BACKEND_URL =
-  import.meta.env.VITE_API_BASE_URL ?? "https://nexusai-rag-assistant.onrender.com";
+import { backendService, BASE_URL } from "./services/backendService";
 
 interface ProcessingJob {
   id: string;
@@ -27,16 +25,8 @@ interface Document {
   status: string;
 }
 
-type QueryResponse = {
-  question: string;
-  answer: string;
-  citations?: any[];
-  evidence?: any[];
-  status?: string;
-};
-
-type CompareResponse = {
-  question: string;
+type AnyResponse = {
+  question?: string;
   answer: string;
   citations?: any[];
   evidence?: any[];
@@ -50,8 +40,8 @@ const App: React.FC = () => {
       id: "1",
       role: "assistant",
       content:
-        "🚀 **NexusAI Multi-Document RAG Ready**\n\n• Upload multiple PDFs\n• Document-level tracking\n• Cross-document search\n• Smart citations",
-      timestamp: Date.now(),
+  `🚀 **NexusAI Multi-Document RAG Ready**\n\nBackend URL: ${BASE_URL}\n\n• Upload multiple PDFs\n• Ask questions about one or more documents\n• Delete or clear documents anytime`,
+        timestamp: Date.now(),
     },
   ]);
 
@@ -123,36 +113,13 @@ const App: React.FC = () => {
     return () => clearInterval(interval);
   }, []);
 
-  const shouldUseCompareMode = (question: string, docsCount: number): boolean => {
-    if (docsCount < 2) return false;
+  const getUsedDocumentLabels = (usedDocIds?: string[]): string[] => {
+    if (!usedDocIds || usedDocIds.length === 0) return [];
 
-    const q = question.toLowerCase().trim();
-
-    const multiDocSignals = [
-      "compare",
-      "all pdf",
-      "all the pdf",
-      "all uploaded",
-      "each pdf",
-      "each document",
-      "every pdf",
-      "every document",
-      "both pdf",
-      "both documents",
-      "three pdf",
-      "3 pdf",
-      "all documents",
-      "these pdfs",
-      "those pdfs",
-      "uploaded pdfs",
-      "uploaded documents",
-      "what each pdf",
-      "what does each pdf",
-      "summarize each pdf",
-      "one line with the title",
-    ];
-
-    return multiDocSignals.some((signal) => q.includes(signal));
+    return usedDocIds.map((id) => {
+      const doc = documents.find((d) => d.id === id);
+      return doc ? doc.title || doc.filename : id;
+    });
   };
 
   // -----------------------------
@@ -240,27 +207,18 @@ const App: React.FC = () => {
     setIsLoading(true);
 
     try {
-      const useCompare = shouldUseCompareMode(question, documents.length);
-
-      let data: QueryResponse | CompareResponse;
-
-      if (useCompare) {
-        const docIds = documents.map((d) => d.id);
-        data = await backendService.compare(question, docIds, 3);
-      } else {
-        data = await backendService.query(question, 5);
-      }
+      const data: AnyResponse = await backendService.query(question, 8);
 
       let extra = "";
 
       if (config.citeSources && data.citations?.length) {
         const citeLines = data.citations
-          .slice(0, 8)
+          .slice(0, 10)
           .map((c: any) => {
             const label =
               c.citation ||
               `${c.author || "Unknown"}, ${c.year || "n.d."}${
-                c.filename ? ` — ${c.filename}` : ""
+                c.title ? ` — ${c.title}` : ""
               }`;
             return `• ${label}`;
           })
@@ -269,12 +227,15 @@ const App: React.FC = () => {
         extra += `\n\n**Citations:**\n${citeLines}`;
       }
 
-      if ((data as CompareResponse).used_doc_ids?.length) {
-        extra += `\n\n**Documents used:** ${(data as CompareResponse).used_doc_ids!.length}`;
+      const usedDocLabels = getUsedDocumentLabels(data.used_doc_ids);
+      if (usedDocLabels.length) {
+        extra += `\n\n**Documents used:**\n${usedDocLabels
+          .map((x) => `• ${x}`)
+          .join("\n")}`;
       }
 
-      if ((data as any).status && (data as any).status !== "answered") {
-        extra += `\n\n**Status:** ${(data as any).status}`;
+      if (data.status && data.status !== "answered") {
+        extra += `\n\n**Status:** ${data.status}`;
       }
 
       const assistantMsg: Message = {
@@ -295,13 +256,13 @@ const App: React.FC = () => {
   };
 
   // -----------------------------
-  // Delete doc (×)
+  // Delete doc
   // -----------------------------
   const deleteDocument = async (docId: string): Promise<void> => {
     if (!docId) return;
     try {
       await backendService.deleteDocument(docId);
-      addAssistant(`🗑️ Deleted document: ${docId}`);
+      addAssistant(`🗑️ Deleted document.`);
       await fetchDocuments();
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Delete failed";
@@ -357,8 +318,7 @@ const App: React.FC = () => {
         />
 
         <div
-          className={`absolute top-4 right-4 flex items-center gap-2 px-3 py-1.5 rounded-full border text-xs font-bold
-          ${
+          className={`absolute top-4 right-4 flex items-center gap-2 px-3 py-1.5 rounded-full border text-xs font-bold ${
             backendStatus === "online"
               ? "bg-green-100 border-green-300 text-green-700"
               : "bg-red-100 border-red-300 text-red-700"

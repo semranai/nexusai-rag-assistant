@@ -101,8 +101,12 @@ def _dedupe_and_sort_citations(citations: List[Dict[str, Any]]) -> List[Dict[str
 
 
 def _contains_inline_citation(answer: str) -> bool:
-    pat = r"\([^)]+,\s*[^)]+,\s*p{1,2}\.\s*[^)]+\)"
-    return bool(re.search(pat, answer))
+    # relaxed: accept both p. and pp., and tolerate slight spacing variation
+    patterns = [
+        r"\([^)]+,\s*[^)]+,\s*p{1,2}\.\s*[^)]+\)",
+        r"\([^)]+,\s*[^)]+\)",
+    ]
+    return any(re.search(p, answer) for p in patterns)
 
 
 # -----------------------------
@@ -530,6 +534,140 @@ def _build_citations_from_used(used_normalized: List[Dict[str, Any]]) -> List[Di
 
 
 # -----------------------------
+# NEW: brief-based comparison helpers
+# -----------------------------
+def _build_citations_from_doc_briefs(doc_briefs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    citations: List[Dict[str, Any]] = []
+    for d in doc_briefs:
+        pages = d.get("pages") or [1]
+        if not isinstance(pages, list):
+            pages = [1]
+        pages = [p for p in pages if isinstance(p, int)] or [1]
+
+        author = _safe_str(d.get("author", "Unknown Author"))
+        year = _safe_str(d.get("year", "n.d."))
+        title = _safe_str(d.get("title", "Unknown Title"))
+        filename = _safe_str(d.get("filename", ""))
+        document_id = _safe_str(d.get("document_id", ""))
+
+        citations.append(
+            {
+                "author": author,
+                "year": year,
+                "title": title,
+                "pages": pages,
+                "citation": _make_citation(_author_short(author), year, pages),
+                "document_id": document_id,
+                "filename": filename,
+            }
+        )
+    return _dedupe_and_sort_citations(citations)
+
+
+def generate_brief_based_comparison_answer(
+    question: str,
+    doc_briefs: List[Dict[str, Any]],
+    chat_model: str = "gpt-4o-mini",
+    temperature: float = 0.1,
+) -> Dict[str, Any]:
+    question = _safe_str(question).strip()
+    if not question:
+        return {
+            "answer": "No question provided.",
+            "citations": [],
+            "evidence": [],
+            "status": "no_question",
+        }
+
+    if not doc_briefs:
+        return {
+            "answer": SCANNED_OR_LOW_TEXT_MSG,
+            "citations": [],
+            "evidence": [],
+            "status": "insufficient_evidence",
+        }
+
+    evidence_lines: List[str] = []
+    for idx, d in enumerate(doc_briefs, start=1):
+        author = _safe_str(d.get("author", "Unknown Author"))
+        year = _safe_str(d.get("year", "n.d."))
+        title = _safe_str(d.get("title", "Unknown Title"))
+        filename = _safe_str(d.get("filename", ""))
+        summary = _safe_str(d.get("summary", "")).strip()
+        citation = _safe_str(d.get("citation", _make_citation(_author_short(author), year, [1])))
+
+        evidence_lines.append(
+            f"DOCUMENT {idx}\n"
+            f"Title: {title}\n"
+            f"Filename: {filename}\n"
+            f"Author: {author}\n"
+            f"Year: {year}\n"
+            f"Summary: {summary}\n"
+            f"Use this citation for this document: {citation}\n"
+        )
+
+    evidence_block = "\n---\n".join(evidence_lines)
+    citations = _build_citations_from_doc_briefs(doc_briefs)
+
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return {
+            "answer": "OpenAI API key missing. Set OPENAI_API_KEY in your environment or .env.",
+            "citations": citations,
+            "evidence": doc_briefs,
+            "status": "config_error",
+        }
+
+    system_msg = (
+        "You are a strictly grounded cross-document analysis assistant.\n"
+        "Use ONLY the document summaries provided.\n"
+        "Do NOT invent details outside the summaries.\n"
+        "Your job is to compare, connect, contrast, and draw conclusions across the documents.\n"
+        "Every major claim should include an inline citation using the provided citation for that document.\n"
+        "If the user's question is generic, still compare the documents using the summaries.\n"
+        "Do not output the fallback 'not mentioned' message unless there are truly no usable summaries.\n"
+        "Be concrete and useful.\n"
+    )
+
+    user_msg = (
+        f"QUESTION:\n{question}\n\n"
+        f"DOCUMENT BRIEFS:\n{evidence_block}\n\n"
+        "INSTRUCTIONS:\n"
+        "- If the question asks for comparison, include: similarities, differences, and a short conclusion.\n"
+        "- If the question asks for themes or connections, identify the shared or contrasting ideas across the documents.\n"
+        "- If the question asks for conclusions, synthesize what follows from the documents together.\n"
+        "- Use inline citations like (Author, Year, p. 1).\n"
+        "- Keep the answer grounded in the provided summaries only.\n"
+    )
+
+    client = OpenAI(api_key=api_key)
+    resp = client.chat.completions.create(
+        model=chat_model,
+        temperature=temperature,
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+    )
+
+    answer = (resp.choices[0].message.content or "").strip()
+    if not answer:
+        return {
+            "answer": NOT_MENTIONED_MSG,
+            "citations": citations,
+            "evidence": doc_briefs,
+            "status": "not_mentioned",
+        }
+
+    return {
+        "answer": answer,
+        "citations": citations,
+        "evidence": doc_briefs,
+        "status": "answered",
+    }
+
+
+# -----------------------------
 # Core answer generators
 # -----------------------------
 def generate_answer(
@@ -595,8 +733,7 @@ def generate_answer(
         "RULES:\n"
         "1) Use ONLY the evidence provided.\n"
         "2) Do NOT use outside knowledge.\n"
-        "3) Every key claim MUST include an inline citation:\n"
-        "   (AuthorLastName, Year, p. X) or (AuthorLastName, Year, pp. X–Y)\n"
+        "3) Every key claim SHOULD include an inline citation.\n"
         f"4) If the evidence is present but the answer is not found, output EXACTLY:\n   {NOT_MENTIONED_MSG}\n"
         f"5) If the evidence is too weak/unusable, output EXACTLY:\n   {INSUFFICIENT_MSG}\n"
         "6) Be concise and clear.\n"
@@ -607,7 +744,7 @@ def generate_answer(
         f"EVIDENCE:\n{evidence_block}\n\n"
         "INSTRUCTIONS:\n"
         "- Answer using ONLY EVIDENCE.\n"
-        "- Add citations inline using (AuthorLastName, Year, p. X).\n"
+        "- Add citations inline when possible using (AuthorLastName, Year, p. X).\n"
         f"- If evidence exists but the answer is not stated, output exactly: {NOT_MENTIONED_MSG}\n"
         f"- If the evidence is too weak to answer, output exactly: {INSUFFICIENT_MSG}\n"
     )
@@ -634,9 +771,6 @@ def generate_answer(
 
     answer = (resp.choices[0].message.content or "").strip()
     if not answer:
-        answer = _fallback_failure_message(question, used_normalized)
-
-    if answer not in {NOT_MENTIONED_MSG, INSUFFICIENT_MSG} and not _contains_inline_citation(answer):
         answer = _fallback_failure_message(question, used_normalized)
 
     if answer == INSUFFICIENT_MSG:
@@ -670,7 +804,7 @@ def generate_comparison_answer(
     question: str,
     retrieved_chunks: List[Dict[str, Any]],
     chat_model: str = "gpt-4o-mini",
-    temperature: float = 0.0,
+    temperature: float = 0.1,
     max_evidence_chars: int = 14000,
 ) -> Dict[str, Any]:
     question = _safe_str(question).strip()
@@ -727,39 +861,27 @@ def generate_comparison_answer(
 
     system_msg = (
         "You are a strictly grounded comparison assistant.\n"
-        "RULES:\n"
-        "1) Use ONLY the evidence provided.\n"
-        "2) Do NOT use outside knowledge.\n"
-        "3) Every document section MUST contain at least one inline citation from that same document.\n"
-        "4) Do NOT collapse all citations into one source.\n"
-        "5) Keep documents separate first, then synthesize.\n"
-        f"6) If evidence exists but the requested comparison is not stated, output EXACTLY:\n   {NOT_MENTIONED_MSG}\n"
-        f"7) If the evidence is too weak/unusable, output EXACTLY:\n   {INSUFFICIENT_MSG}\n"
-        "8) Output MUST be structured exactly as:\n"
-        "   Document 1\n"
-        "   Document 2\n"
-        "   ...\n"
-        "   Similarities\n"
-        "   Differences\n"
-        "   Short takeaway\n"
+        "Use ONLY the provided evidence.\n"
+        "Keep documents separate first, then synthesize.\n"
+        "Every document section should use evidence from that document.\n"
+        "Answer even when the user asks a broad compare question.\n"
+        "Do not default to 'not mentioned' unless the evidence is truly unusable.\n"
     )
 
     user_msg = (
         f"QUESTION:\n{question}\n\n"
         f"EVIDENCE:\n{evidence_block}\n\n"
         "INSTRUCTIONS:\n"
-        f"- There are {expected_doc_count} documents in the evidence. You MUST include all of them.\n"
-        "- First, create one section per document in order: Document 1, Document 2, etc.\n"
-        "- In each document section:\n"
-        "  * describe what that specific document says\n"
-        "  * include at least one inline citation from that document section\n"
-        "- Then write:\n"
+        f"- There are {expected_doc_count} documents in the evidence.\n"
+        "- Structure the answer with:\n"
+        "  Document 1\n"
+        "  Document 2\n"
+        "  ...\n"
         "  Similarities\n"
         "  Differences\n"
-        "  Short takeaway\n"
+        "  Conclusion\n"
         "- Use ONLY the provided evidence.\n"
-        f"- If evidence exists but the answer is not stated, output exactly: {NOT_MENTIONED_MSG}\n"
-        f"- If the evidence is too weak to answer, output exactly: {INSUFFICIENT_MSG}\n"
+        "- Add inline citations when possible.\n"
     )
 
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -784,9 +906,6 @@ def generate_comparison_answer(
 
     answer = (resp.choices[0].message.content or "").strip()
     if not answer:
-        answer = _fallback_failure_message(question, used_normalized)
-
-    if answer not in {NOT_MENTIONED_MSG, INSUFFICIENT_MSG} and not _contains_inline_citation(answer):
         answer = _fallback_failure_message(question, used_normalized)
 
     if answer == INSUFFICIENT_MSG:
