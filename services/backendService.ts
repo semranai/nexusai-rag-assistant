@@ -18,7 +18,7 @@ export type DocumentInfo = {
   pages: number;
 };
 
-const DEFAULT_BASE_URL = "http://127.0.0.1:8000";
+const DEFAULT_BASE_URL = "https://nexusai-rag-assistant.onrender.com";
 const BASE_URL = (import.meta as any).env?.VITE_BACKEND_URL || DEFAULT_BASE_URL;
 
 export class BackendService {
