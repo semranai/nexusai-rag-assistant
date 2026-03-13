@@ -25,6 +25,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", os.path.join(BASE_DIR, "uploaded_pdfs"))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+# In-memory brief cache to avoid re-summarizing the same files on every query
+_doc_brief_cache: Dict[str, Dict[str, Any]] = {}
+
+_last_ingest_error: Optional[str] = None
+
 
 # -----------------------------
 # Request Schemas
@@ -57,7 +62,7 @@ class SummarizeDocRequest(BaseModel):
     max_chars: int = 1200
 
 
-app = FastAPI(title="NexusAI RAG Assistant", version="CHECK136")
+app = FastAPI(title="NexusAI RAG Assistant", version="CHECK137")
 
 app.add_middleware(
     CORSMiddleware,
@@ -66,8 +71,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-_last_ingest_error: Optional[str] = None
 
 
 @app.get("/")
@@ -81,7 +84,7 @@ def root():
 
 
 # -----------------------------
-# Metadata override helpers
+# Metadata helpers
 # -----------------------------
 def _extract_presenter(text: str) -> str:
     if not text:
@@ -197,32 +200,6 @@ def _make_metadata_chunk_text(meta: Dict[str, str], filename: str) -> str:
     )
 
 
-def _chunks_indexed_count() -> int:
-    try:
-        if getattr(vector_store, "_embeddings", None) is not None:
-            return int(vector_store._embeddings.shape[0])  # type: ignore
-    except Exception:
-        pass
-    return 0
-
-
-def _get_doc_by_id(doc_id: str) -> Optional[StoredDocument]:
-    for d in vector_store.list_documents():
-        if d.document_id == doc_id:
-            return d
-    return None
-
-
-def _best_effort_persist_vector_store() -> None:
-    for meth in ("save", "persist", "dump", "flush"):
-        fn = getattr(vector_store, meth, None)
-        if callable(fn):
-            try:
-                fn()
-            except Exception:
-                pass
-
-
 def _normalize_for_match(text: str) -> str:
     text = (text or "").lower().strip()
     text = text.replace(".pdf", " ")
@@ -267,8 +244,7 @@ def _read_pdf_text(pdf_path: str, max_pages: int = 6) -> str:
 
 
 def _trim_text(text: str, max_chars: int = 7000) -> str:
-    text = re.sub(r"\s+", " ", text or "").strip()
-    return text[:max_chars]
+    return re.sub(r"\s+", " ", text or "").strip()[:max_chars]
 
 
 def _get_openai_client() -> Optional[OpenAI]:
@@ -299,6 +275,32 @@ def _chat_completion(system_msg: str, user_msg: str, temperature: float = 0.1) -
     except Exception as e:
         print(f"OpenAI chat error: {e}")
         return ""
+
+
+def _chunks_indexed_count() -> int:
+    try:
+        if getattr(vector_store, "_embeddings", None) is not None:
+            return int(vector_store._embeddings.shape[0])  # type: ignore
+    except Exception:
+        pass
+    return 0
+
+
+def _get_doc_by_id(doc_id: str) -> Optional[StoredDocument]:
+    for d in vector_store.list_documents():
+        if d.document_id == doc_id:
+            return d
+    return None
+
+
+def _best_effort_persist_vector_store() -> None:
+    for meth in ("save", "persist", "dump", "flush"):
+        fn = getattr(vector_store, meth, None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
 
 
 def _doc_citation(doc: StoredDocument, page: int = 1) -> Dict[str, Any]:
@@ -344,6 +346,25 @@ def _dedupe_results_keep_best(results: List[Dict[str, Any]]) -> List[Dict[str, A
     deduped = list(best_by_chunk.values())
     deduped.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
     return deduped
+
+
+def _extract_keywords_naive(text: str, top_n: int = 6) -> List[str]:
+    stop = {
+        "the", "and", "for", "with", "from", "into", "about", "this", "that",
+        "these", "those", "document", "chapter", "paper", "article", "study",
+        "discusses", "main", "ideas", "presented", "using", "used", "their",
+        "there", "which", "what", "when", "where", "have", "has", "been",
+        "are", "was", "were", "will", "would", "could", "should", "pdf",
+        "author", "presented", "page", "title", "filename", "year",
+    }
+    toks = re.findall(r"[a-z][a-z\-]{2,}", (text or "").lower())
+    counts: Dict[str, int] = {}
+    for tok in toks:
+        if tok in stop:
+            continue
+        counts[tok] = counts.get(tok, 0) + 1
+    ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+    return [k for k, _ in ranked[:top_n]]
 
 
 # -----------------------------
@@ -455,6 +476,9 @@ def _ingest_one_pdf(pdf_path: str, force_reingest: bool = False) -> None:
         vector_store.add_document(doc, stored_chunks, embeddings)
         _last_ingest_error = None
 
+        # invalidate brief cache for this document
+        _doc_brief_cache.pop(doc_id, None)
+
     except Exception as e:
         _last_ingest_error = f"{os.path.basename(pdf_path)}: {e}"
         print(f"Ingestion warning: {_last_ingest_error}")
@@ -477,28 +501,22 @@ def startup_init():
 
 
 # -----------------------------
-# Brief-first, topic-agnostic reasoning
+# Topic-agnostic brief builder
 # -----------------------------
-def _extract_keywords_naive(text: str, top_n: int = 6) -> List[str]:
-    stop = {
-        "the", "and", "for", "with", "from", "into", "about", "this", "that",
-        "these", "those", "document", "chapter", "paper", "article", "study",
-        "discusses", "main", "ideas", "presented", "using", "used", "their",
-        "there", "which", "what", "when", "where", "have", "has", "been",
-        "are", "was", "were", "will", "would", "could", "should", "pdf",
-        "author", "presented", "page", "title", "filename", "year",
-    }
-    toks = re.findall(r"[a-z][a-z\-]{2,}", (text or "").lower())
-    counts: Dict[str, int] = {}
-    for tok in toks:
-        if tok in stop:
-            continue
-        counts[tok] = counts.get(tok, 0) + 1
-    ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
-    return [k for k, _ in ranked[:top_n]]
+def _brief_cache_key(doc: StoredDocument) -> str:
+    try:
+        mtime = int(os.path.getmtime(doc.file_path)) if doc.file_path and os.path.exists(doc.file_path) else 0
+    except Exception:
+        mtime = 0
+    return f"{doc.document_id}|{doc.title}|{doc.author}|{doc.year}|{mtime}"
 
 
 def _build_general_doc_brief(doc: StoredDocument) -> Dict[str, Any]:
+    cache_key = _brief_cache_key(doc)
+    cached = _doc_brief_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     title = doc.title or doc.filename
     author = doc.author or "Unknown Author"
     year = doc.year or "n.d."
@@ -540,8 +558,23 @@ def _build_general_doc_brief(doc: StoredDocument) -> Dict[str, Any]:
             pass
 
     if not summary:
-        title_clean = re.sub(r"\s+", " ", title).strip()
-        summary = f"This document presents the main ideas, topics, or arguments covered in {title_clean}."
+        # fallback: best-effort first useful sentence or generic doc summary
+        sents = _split_sentences(text)
+        good = []
+        for s in sents:
+            low = s.lower()
+            if len(s.split()) < 8:
+                continue
+            if low.startswith(("title:", "author:", "year:", "filename:", "document metadata")):
+                continue
+            if sum(ch.isdigit() for ch in s) / max(1, len(s)) > 0.25:
+                continue
+            good.append(s)
+        if good:
+            summary = good[0]
+        else:
+            title_clean = re.sub(r"\s+", " ", title).strip()
+            summary = f"This document presents the main ideas, themes, or arguments covered in {title_clean}."
 
     if len(summary) > 280:
         summary = summary[:277].rstrip() + "..."
@@ -549,7 +582,7 @@ def _build_general_doc_brief(doc: StoredDocument) -> Dict[str, Any]:
     if not keywords:
         keywords = _extract_keywords_naive(f"{title} {text}", top_n=5)
 
-    return {
+    brief = {
         "document_id": doc.document_id,
         "filename": doc.filename,
         "title": title,
@@ -560,6 +593,8 @@ def _build_general_doc_brief(doc: StoredDocument) -> Dict[str, Any]:
         "keywords": keywords[:6],
         "citation": citation,
     }
+    _doc_brief_cache[cache_key] = brief
+    return brief
 
 
 def _build_briefs_for_docs(docs: List[StoredDocument]) -> List[Dict[str, Any]]:
@@ -632,14 +667,15 @@ def _general_compare_from_briefs(question: str, docs: List[StoredDocument]) -> D
     system_msg = (
         "You are a grounded multi-document analyst. "
         "Use ONLY the supplied document briefs. "
-        "Answer the user's comparison/themes/conclusions question in a general, topic-agnostic way. "
-        "Do not assume any specific domain. "
-        "Include inline citations exactly as supplied."
+        "Answer the user's question in one coherent response. "
+        "If multiple documents are relevant, combine them into one explanation rather than splitting into separate unrelated answers. "
+        "For compare/themes/conclusions requests, identify connections, differences, and overall conclusions. "
+        "Stay topic-agnostic. Include inline citations exactly as supplied."
     )
     user_msg = (
         f"Question: {question}\n\n"
         f"Document briefs:\n{chr(10).join(evidence_lines)}\n\n"
-        "Write a grounded response with sections when useful."
+        "Write one combined grounded answer."
     )
 
     answer = _chat_completion(system_msg, user_msg, temperature=0.1)
@@ -862,6 +898,38 @@ def _is_compare_question(question: str, docs_count: int) -> bool:
     return any(s in q for s in signals)
 
 
+def _is_thematic_synthesis_question(question: str, docs_count: int) -> bool:
+    if docs_count < 2:
+        return False
+
+    q = (question or "").lower().strip()
+
+    synthesis_signals = [
+        "tell me about",
+        "talk about",
+        "discuss",
+        "relationship between",
+        "relationships between",
+        "connection between",
+        "connections between",
+        "how are",
+        "how do",
+        "linked",
+        "related",
+        "interplay",
+        "intersection",
+        "role of",
+        "influence of",
+        "impact of",
+        "across the uploaded pdfs",
+        "across the documents",
+        "across the uploaded documents",
+    ]
+
+    separator_count = q.count(",") + len(re.findall(r"\band\b", q))
+    return any(s in q for s in synthesis_signals) and separator_count >= 1
+
+
 def _is_multi_concept_question(question: str, docs_count: int) -> bool:
     if docs_count < 2:
         return False
@@ -1016,7 +1084,7 @@ def system_status() -> Dict[str, Any]:
     docs = vector_store.list_documents()
     return {
         "service": "NexusAI RAG Assistant",
-        "version": "CHECK136",
+        "version": "CHECK137",
         "openai_key_present": bool(os.getenv("OPENAI_API_KEY", "").strip()),
         "embedding_model": os.getenv("EMBEDDING_MODEL", "text-embedding-3-large"),
         "chat_model": os.getenv("CHAT_MODEL", "gpt-4o-mini"),
@@ -1094,6 +1162,11 @@ def delete_document(document_id: str) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # clear brief cache for this doc
+    for k in list(_doc_brief_cache.keys()):
+        if k.startswith(f"{document_id}|"):
+            _doc_brief_cache.pop(k, None)
+
     return {
         "ok": True,
         "deleted": removed,
@@ -1123,6 +1196,8 @@ def clear_all() -> Dict[str, Any]:
         except Exception:
             pass
 
+    _doc_brief_cache.clear()
+
     return {
         "ok": True,
         "documents_removed": removed_count,
@@ -1147,7 +1222,7 @@ def query_docs(req: QueryRequest) -> Dict[str, Any]:
             "status": "answered",
         }
 
-    print("QUERY ROUTE CHECK136:", req.question)
+    print("QUERY ROUTE CHECK137:", req.question)
 
     docs = vector_store.list_documents()
     doc_ids = [d.document_id for d in docs]
@@ -1164,6 +1239,7 @@ def query_docs(req: QueryRequest) -> Dict[str, Any]:
             "status": "no_documents",
         }
 
+    # summarize all docs
     if _is_summarize_all_question(question, docs_count):
         lines: List[str] = []
         all_citations: List[Dict[str, Any]] = []
@@ -1180,7 +1256,20 @@ def query_docs(req: QueryRequest) -> Dict[str, Any]:
             "status": "answered",
         }
 
+    # compare / themes / conclusions
     if _is_compare_question(question, docs_count):
+        result = _general_compare_from_briefs(question, docs)
+        return {
+            "question": question,
+            "answer": result["answer"],
+            "citations": result["citations"],
+            "evidence": result["evidence"],
+            "used_doc_ids": doc_ids,
+            "status": result["status"],
+        }
+
+    # one coherent combined answer across many docs
+    if _is_thematic_synthesis_question(question, docs_count):
         result = _general_compare_from_briefs(question, docs)
         return {
             "question": question,
@@ -1195,6 +1284,7 @@ def query_docs(req: QueryRequest) -> Dict[str, Any]:
     if matched_doc is None:
         matched_doc = _find_doc_by_keyword(question, docs)
 
+    # summary of a specific doc
     if matched_doc and _is_summaryish_question(question):
         item = _direct_doc_line(matched_doc)
         return {
@@ -1222,7 +1312,8 @@ def query_docs(req: QueryRequest) -> Dict[str, Any]:
             "status": item["status"],
         }
 
-    if matched_doc and any(x in question.lower() for x in ["pdf", "document", "file", "about", "explain"]):
+    # only use single-doc summary branch when question explicitly refers to a file/doc/pdf
+    if matched_doc and any(x in question.lower() for x in ["pdf", "document", "file"]):
         item = _direct_doc_line(matched_doc)
         return {
             "question": question,
@@ -1235,6 +1326,7 @@ def query_docs(req: QueryRequest) -> Dict[str, Any]:
             "status": item["status"],
         }
 
+    # multi-concept grounded definitions
     if _is_multi_concept_question(question, docs_count):
         concepts = _decompose_question(question)
         if concepts:
@@ -1262,6 +1354,7 @@ def query_docs(req: QueryRequest) -> Dict[str, Any]:
                 "status": "answered",
             }
 
+    # matched single-doc grounded QA, with brief fallback
     if matched_doc:
         narrowed_question = _strip_doc_reference_from_question(question, matched_doc)
         chunks = _vector_search_in_doc(
@@ -1299,6 +1392,7 @@ def query_docs(req: QueryRequest) -> Dict[str, Any]:
             "status": result.get("status", "unknown"),
         }
 
+    # generic global QA
     chunks = _multi_query_vector_search(question, top_k=max(1, int(req.top_k)))
     result = generate_answer(
         question,
